@@ -1,4 +1,4 @@
-CMAKE_MINIMUM_REQUIRED(VERSION 3.1)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 PROJECT(DGalerkin VERSION 1.3.6)
 
 # put all generated files in a single folder (required in windows for exe linked to dlls)
@@ -26,7 +26,11 @@ ENDIF()
 # find gmsh-sdk
 # gmsh.h
 SET(GMSH_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/3rdParty/gmsh/include)
-SET(GMSH_LIBRARIES ${PROJECT_SOURCE_DIR}/3rdParty/gmsh/lib/libgmsh.so)
+IF(APPLE)
+    SET(GMSH_LIBRARIES ${PROJECT_SOURCE_DIR}/3rdParty/gmsh/lib/libgmsh.dylib)
+ELSE()
+    SET(GMSH_LIBRARIES ${PROJECT_SOURCE_DIR}/3rdParty/gmsh/lib/libgmsh.so)
+ENDIF()
 SET(GMSH_EXECUTABLE ${PROJECT_SOURCE_DIR}/3rdParty/gmsh/bin/gmsh)
 
 FIND_PATH(GMSH_INCLUDE_DIRS NAMES "gmsh.h")
@@ -39,7 +43,9 @@ ENDIF()
 INCLUDE_DIRECTORIES(${GMSH_INCLUDE_DIRS})
 
 # libgmsh.so
-FIND_LIBRARY(GMSH_LIBRARIES gmsh)
+FIND_LIBRARY(GMSH_LIBRARIES gmsh
+    HINTS ${PROJECT_SOURCE_DIR}/3rdParty/gmsh/lib
+    NO_DEFAULT_PATH)
 MESSAGE(STATUS "GMSH_LIBRARIES=" ${GMSH_LIBRARIES})
 
 IF(NOT GMSH_LIBRARIES)
@@ -74,8 +80,17 @@ endif()
 
 # INCLUDE_DIRECTORIES(${EIGEN_INCLUDE_DIRS})
 # FIND_PACKAGE(EIGEN REQUIRED)
-SET(EIGEN_INCLUDE_DIRS "/usr/include/eigen3" CACHE PATH "Eigen directory override" FORCE)
-FIND_PATH(EIGEN_INCLUDE_DIRS NAMES "Eigen/Eigen")
+IF(APPLE)
+    # Homebrew paths: Apple Silicon (/opt/homebrew) or Intel (/usr/local)
+    FIND_PATH(EIGEN_INCLUDE_DIRS NAMES "Eigen/Eigen"
+        HINTS
+            /opt/homebrew/include/eigen3
+            /usr/local/include/eigen3
+    )
+ELSE()
+    SET(EIGEN_INCLUDE_DIRS "/usr/include/eigen3" CACHE PATH "Eigen directory override" FORCE)
+    FIND_PATH(EIGEN_INCLUDE_DIRS NAMES "Eigen/Eigen")
+ENDIF()
 MESSAGE(STATUS "EIGEN_INCLUDE_DIRS=" ${EIGEN_INCLUDE_DIRS})
 if(NOT EIGEN_INCLUDE_DIRS)
     MESSAGE(FATAL_ERROR "Eigen not found!")
@@ -85,6 +100,22 @@ INCLUDE_DIRECTORIES(${EIGEN_INCLUDE_DIRS})
 # SET(EIGEN_INCLUDE_DIRS "/usr/share/eigen3/cmake" CACHE PATH "Eigen directory override" FORCE)
 
 # OpenMP
+# On macOS with Apple Clang, libomp must be installed via Homebrew (brew install libomp)
+IF(APPLE)
+    FIND_PROGRAM(BREW_EXECUTABLE brew)
+    IF(BREW_EXECUTABLE)
+        EXECUTE_PROCESS(COMMAND ${BREW_EXECUTABLE} --prefix libomp
+            OUTPUT_VARIABLE LIBOMP_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+        IF(LIBOMP_PREFIX)
+            SET(OpenMP_C_FLAGS   "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+            SET(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+            SET(OpenMP_C_LIB_NAMES "omp")
+            SET(OpenMP_CXX_LIB_NAMES "omp")
+            SET(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        ENDIF()
+    ENDIF()
+ENDIF()
+
 FIND_PACKAGE(OpenMP REQUIRED)
 
 if(OPENMP_FOUND)
@@ -95,14 +126,20 @@ if(OPENMP_FOUND)
 endif()
 
 # VTK
+IF(NOT APPLE)
+    SET(VTK_DIR "/usr/lib/x86_64-linux-gnu/cmake/vtk-9.1" CACHE PATH "VTK directory override" FORCE)
+ENDIF()
 FIND_PACKAGE(VTK COMPONENTS IOXML REQUIRED)
-SET(VTK_DIR "/usr/lib/x86_64-linux-gnu/cmake/vtk-9.1" CACHE PATH "VTK directory override" FORCE)
 
 SET(WAVE_INCLUDE src/wave)
 INCLUDE_DIRECTORIES(${WAVE_INCLUDE})
 
 SET(WAVE_LD ${PROJECT_SOURCE_DIR}/build/bin)
 LINK_DIRECTORIES(${WAVE_LD})
+
+IF(APPLE)
+    LINK_DIRECTORIES(/opt/homebrew/lib)
+ENDIF()
 
 # Libraries
 INCLUDE_DIRECTORIES(include)

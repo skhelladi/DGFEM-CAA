@@ -4,8 +4,7 @@
 #include <iostream>
 #include <omp.h>
 
-#include <parallel/algorithm>
-#include <parallel/settings.h>
+
 
 #include "Mesh.h"
 #include "configParser.h"

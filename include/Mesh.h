@@ -8,7 +8,6 @@
 #include <vector>
 
 #include <algorithm>
-#include <execution>
 #include <numeric>
 
 //! /////////
@@ -339,7 +338,7 @@ bool isNCoincidentValues(std::vector<T> &vec1, std::vector<T> &vec2, size_t Num)
 
     // value = std::equal(std::execution::seq, vec1.begin(), vec1.end(), vec2.begin());
 
-    return std::equal(std::execution::seq, vec1.begin(), vec1.end(), vec2.begin());
+    return std::equal(vec1.begin(), vec1.end(), vec2.begin());
 }
 
 template <typename T>
