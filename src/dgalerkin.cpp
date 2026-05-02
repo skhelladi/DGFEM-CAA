@@ -4,34 +4,25 @@
 #include <iostream>
 #include <omp.h>
 
-
-
 #include "Mesh.h"
+#include "Parallel.h"
 #include "configParser.h"
 #include "solver.h"
 
 int main(int argc, char **argv)
 {
-    /**
-     * The DGarlekin solver requires 2 arguments
-     * 1 : the Mesh file (.msh)
-     * 2 : the config file (.conf)
-     *
-     * e.g. ./dgarlerkin mymesh.msh myconfig.conf
-     */
-
-    // __gnu_parallel::_Settings s;
-    // s.algorithm_strategy = __gnu_parallel::force_parallel;
-    // __gnu_parallel::_Settings::set(s);
+    Parallel::init(&argc, &argv);
 
     if (argc != 2)
     {
+        Parallel::finalize();
         return E2BIG;
     }
     std::string config_name = argv[1];
 
     gmsh::initialize();
-    gmsh::option::setNumber("General.Terminal", 1.0);
+    // Suppress gmsh terminal output on non-root ranks to avoid log flooding
+    gmsh::option::setNumber("General.Terminal", Parallel::isRoot() ? 1.0 : 0.0);
 
     Config config;
 
@@ -77,8 +68,11 @@ int main(int argc, char **argv)
         solver::rungeKutta(u, mesh, config);
     else Fatal_Error("Time integration method error")    
 
-    mesh.writePVD("results.pvd");
+    if (Parallel::isRoot())
+        mesh.writePVD("results.pvd");
+
     gmsh::finalize();
+    Parallel::finalize();
 
     return EXIT_SUCCESS;
 }

@@ -5,10 +5,41 @@
 #include <iostream>
 #include <omp.h>
 #include <string>
+#include <unordered_map>
 
 #include "Mesh.h"
+#include "Parallel.h"
 #include "configParser.h"
 #include "utils.h"
+
+#ifdef DG_USE_MPI
+// Forward declarations: implementations live at the bottom of this file,
+// next to buildPartitionLayout() (the partition-aware helpers section).
+static void loadElementsByPartition(const PartitionLayout &layout,
+                                    int elementType,
+                                    const std::vector<double> &integrationParamCoords,
+                                    std::vector<std::size_t> &elTags,
+                                    std::vector<std::size_t> &elNodeTags,
+                                    std::vector<double> &jacobians,
+                                    std::vector<double> &jacobianDets,
+                                    std::vector<double> &intPtCoords,
+                                    std::vector<int> &haloOwnerRank,
+                                    int &nLocal,
+                                    int &nHalo);
+
+// Concatenated barycenters (owned then halo) — same ordering as elTags.
+static void loadBarycentersByPartition(const PartitionLayout &layout,
+                                       int elementType,
+                                       std::vector<double> &barycenters);
+
+// Concatenated element face/edge node tags (owned then halo).
+// faceNumNodes = 4 for hex faces, 3 for tet faces, 2 for line edges.
+// Pass -1 in faceNumNodes to use getElementEdgeNodes (1D edges).
+static void loadFaceNodesByPartition(const PartitionLayout &layout,
+                                     int elementType,
+                                     int faceNumNodes,
+                                     std::vector<std::size_t> &fNodeTags);
+#endif
 
 /**
  * Mesh constructor: load the mesh data and parameters thanks to
@@ -44,35 +75,55 @@ Mesh::Mesh(Config config) : config(config)
     gmsh::model::mesh::getElementProperties(m_elType[0], m_elName, m_elDim,
                                             m_elOrder, m_elNumNodes, m_elParamCoord, _numPrimaryNodes);
 
-    gmsh::model::mesh::getElementsByType(m_elType[0], m_elTags, m_elNodeTags);
-    m_elNum = (int)m_elTags.size();
     m_elIntType = "Gauss" + std::to_string(2 * m_elOrder);
 
-    // std::vector<double> m_elWeight;
+    // Integration points (mesh-independent; depends only on element type)
     gmsh::model::mesh::getIntegrationPoints(m_elType[0], m_elIntType, m_elParamCoord, m_elWeight);
-    // pp("integration points to integrate order " + std::to_string(m_elOrder*2) + " polynomials", m_elParamCoord, 3);
 
     screen_display::write_string("Elements - Compute Jacobian", GREEN);
 
-    // std::vector<double> _localCoord;
-
-    // screen_display::write_string("flag 0", RED);
-
     int _numOrientations;
-    // const std::vector<int>& wantedOrientations = std::vector<int>()
     int _numComponents;
     gmsh::model::mesh::getBasisFunctions(m_elType[0], m_elParamCoord, config.elementType,
                                          _numComponents, m_elBasisFcts, _numOrientations);
     gmsh::model::mesh::getBasisFunctions(m_elType[0], m_elParamCoord, "Grad" + config.elementType,
                                          _numComponents, m_elUGradBasisFcts, _numOrientations);
 
-    // screen_display::write_string(m_elIntType, RED);
-    // screen_display::write_string("Grad" + config.elementType, RED);
-    // gmsh::model::mesh::getBasisFunctions(m_elType[0], m_elIntType, "Grad" + config.elementType,
-    //                                      m_elIntParamCoords, *new int, m_elUGradBasisFcts);
+#ifdef DG_USE_MPI
+    bool usePartition = (Parallel::size() > 1);
+    std::vector<int> haloOwnerRank;
+    int nLocal = 0, nHalo = 0;
+    if (usePartition)
+    {
+        // Partitioned load: each rank only allocates [owned | halo].
+        PartitionLayout layout = buildPartitionLayout();
+        loadElementsByPartition(layout, m_elType[0], m_elParamCoord,
+                                m_elTags, m_elNodeTags,
+                                m_elJacobians, m_elJacobianDets, m_elIntPtCoords,
+                                haloOwnerRank, nLocal, nHalo);
+        m_elNum = nLocal + nHalo;
 
-    gmsh::model::mesh::getJacobians(m_elType[0], m_elParamCoord, m_elJacobians,
-                                    m_elJacobianDets, m_elIntPtCoords);
+        // Member partition state (replaces the old global m_elOwnerRank/range)
+        m_localElStart = 0;
+        m_localElEnd   = nLocal;
+        const int myRank = Parallel::rank();
+        m_elOwnerRank.assign(m_elNum, myRank);
+        for (int i = 0; i < nHalo; ++i)
+            m_elOwnerRank[nLocal + i] = haloOwnerRank[i];
+
+        std::cout << "[MPI rank " << myRank << "] m_elNum=" << m_elNum
+                  << " (" << nLocal << " local + " << nHalo << " halo)\n"
+                  << std::flush;
+    }
+    else
+#endif
+    {
+        // Non-MPI / single-rank path: full global mesh on this process.
+        gmsh::model::mesh::getElementsByType(m_elType[0], m_elTags, m_elNodeTags);
+        m_elNum = (int)m_elTags.size();
+        gmsh::model::mesh::getJacobians(m_elType[0], m_elParamCoord, m_elJacobians,
+                                        m_elJacobianDets, m_elIntPtCoords);
+    }
 
     // std::ofstream _outfile_("m_elJacobians.txt");
     // _outfile_ << "size=" << m_elJacobians.size() << std::endl;
@@ -163,22 +214,37 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Faces treatment", GREEN);
     start = std::chrono::system_clock::now();
     m_fDim = m_elDim - 1;
+    const bool hasQuadrilateralFaces = m_elName.find("Hexahedron") != std::string::npos;
     m_fName = m_fDim == 0 ? "point" : m_fDim == 1 ? "line"
-                                  : m_fDim == 2   ? "triangle"
-                                                  : "None"; // Quads not yet supported.
+                                  : m_fDim == 2   ? (hasQuadrilateralFaces ? "quadrangle" : "triangle")
+                                                  : "None";
     m_fNumNodes = m_fDim == 0 ? 1 : m_fDim == 1 ? 1 + m_elOrder
-                                : m_fDim == 2   ? (m_elOrder + 1) * (m_elOrder + 2) / 2
-                                                : 0; // Triangular elements only.
+                                : m_fDim == 2   ? (hasQuadrilateralFaces ? (m_elOrder + 1) * (m_elOrder + 1)
+                                                                           : (m_elOrder + 1) * (m_elOrder + 2) / 2)
+                                                : 0;
 
     m_fType = gmsh::model::mesh::getElementType(m_fName, m_elOrder);
 
     /**
-     * [1] Get Faces for all elements
+     * [1] Get Faces for all elements (local + halo in MPI mode)
      */
-    if (m_fDim < 2)
-        gmsh::model::mesh::getElementEdgeNodes(m_elType[0], m_elFNodeTags, -1);
+#ifdef DG_USE_MPI
+    if (Parallel::size() > 1)
+    {
+        // Re-classify: we need the layout again to know which entities to walk.
+        // (Cheap: it just queries gmsh, no re-partitioning.)
+        PartitionLayout layout = buildPartitionLayout();
+        const int faceNumNodes = (m_fDim < 2) ? -1 : (hasQuadrilateralFaces ? 4 : 3);
+        loadFaceNodesByPartition(layout, m_elType[0], faceNumNodes, m_elFNodeTags);
+    }
     else
-        gmsh::model::mesh::getElementFaceNodes(m_elType[0], 3, m_elFNodeTags, -1);
+#endif
+    {
+        if (m_fDim < 2)
+            gmsh::model::mesh::getElementEdgeNodes(m_elType[0], m_elFNodeTags, -1);
+        else
+            gmsh::model::mesh::getElementFaceNodes(m_elType[0], hasQuadrilateralFaces ? 4 : 3, m_elFNodeTags, -1);
+    }
 
     m_fNumPerEl = m_elFNodeTags.size() / (m_elNum * m_fNumNodes);
     end = std::chrono::system_clock::now();
@@ -283,28 +349,31 @@ Mesh::Mesh(Config config) : config(config)
 
         if (m_fDim == 2)
         {
-            //! only primary nodes are used
-            std::vector<double> p1 = {fIntPtCoord(f, 0, 0), fIntPtCoord(f, 0, 1), fIntPtCoord(f, 0, 2)};
-            std::vector<double> p2 = {fIntPtCoord(f, 1, 0), fIntPtCoord(f, 1, 1), fIntPtCoord(f, 1, 2)};
-            std::vector<double> p3 = {fIntPtCoord(f, 2, 0), fIntPtCoord(f, 2, 1), fIntPtCoord(f, 2, 2)};
+            // Build T and B from the first two edges of the face (Gram-Schmidt).
+            // Using node positions is robust for any integration rule (avoids
+            // collinear integration-point triplets that caused delta=0 / NaN).
+            std::vector<double> n0coord, n1coord, n2coord, _param;
+            int _dim, _tag;
+            gmsh::model::mesh::getNode(fNodeTag(f, 0), n0coord, _param, _dim, _tag);
+            gmsh::model::mesh::getNode(fNodeTag(f, 1), n1coord, _param, _dim, _tag);
+            gmsh::model::mesh::getNode(fNodeTag(f, 2), n2coord, _param, _dim, _tag);
 
-            double h = sqrt(pow(p2[0] - p1[0], 2) + pow(p2[1] - p1[1], 2) + pow(p2[2] - p1[2], 2));
-            double i = ((p2[0] - p1[0]) * (p3[0] - p1[0]) + (p2[1] - p1[1]) * (p3[1] - p1[1]) + (p2[2] - p1[2]) * (p3[2] - p1[2])) / h;
-            double j = sqrt(pow(p3[0] - p1[0], 2) + pow(p3[1] - p1[1], 2) + pow(p3[2] - p1[2], 2) - pow(i, 2));
+            // First edge: T = normalize(n1 - n0)
+            T[0] = n1coord[0] - n0coord[0];
+            T[1] = n1coord[1] - n0coord[1];
+            T[2] = n1coord[2] - n0coord[2];
+            int dim3 = 3;
+            eigen::normalize(T.data(), dim3);
 
-            double u1(0), v1(0);
-            double u2(h), v2(0);
-            double u3(i), v3(j);
-
-            double delta = fabs(u2 - u1) * fabs(v3 - v1) - fabs(v2 - v1) * fabs(u3 - u1);
-
-            T[0] = (fabs(v3 - v1) * (p2[0] - p1[0]) - fabs(v2 - v1) * (p3[0] - p1[0])) / delta;
-            T[1] = (fabs(v3 - v1) * (p2[1] - p1[1]) - fabs(v2 - v1) * (p3[1] - p1[1])) / delta;
-            T[2] = (fabs(v3 - v1) * (p2[2] - p1[2]) - fabs(v2 - v1) * (p3[2] - p1[2])) / delta;
-
-            B[0] = -(fabs(u3 - u1) * (p2[0] - p1[0]) - fabs(u2 - u1) * (p3[0] - p1[0])) / delta;
-            B[1] = -(fabs(u3 - u1) * (p2[1] - p1[1]) - fabs(u2 - u1) * (p3[1] - p1[1])) / delta;
-            B[2] = -(fabs(u3 - u1) * (p2[2] - p1[2]) - fabs(u2 - u1) * (p3[2] - p1[2])) / delta;
+            // Second edge projected out of T: B = normalize((n2-n0) - ((n2-n0)·T) T)
+            double e2x = n2coord[0] - n0coord[0];
+            double e2y = n2coord[1] - n0coord[1];
+            double e2z = n2coord[2] - n0coord[2];
+            double proj = e2x * T[0] + e2y * T[1] + e2z * T[2];
+            B[0] = e2x - proj * T[0];
+            B[1] = e2y - proj * T[1];
+            B[2] = e2z - proj * T[2];
+            eigen::normalize(B.data(), dim3);
         }
 
         // screen_display::write_value("delta", delta);
@@ -451,7 +520,17 @@ Mesh::Mesh(Config config) : config(config)
 
     double dotProduct;
     std::vector<double> m_elBarycenters, fNodeCoord(3), elOuterDir(3), paramCoords;
-    gmsh::model::mesh::getBarycenters(m_elType[0], -1, false, true, m_elBarycenters);
+#ifdef DG_USE_MPI
+    if (Parallel::size() > 1)
+    {
+        PartitionLayout layout = buildPartitionLayout();
+        loadBarycentersByPartition(layout, m_elType[0], m_elBarycenters);
+    }
+    else
+#endif
+    {
+        gmsh::model::mesh::getBarycenters(m_elType[0], -1, false, true, m_elBarycenters);
+    }
 
     m_elFOrientation.clear();
 
@@ -667,6 +746,15 @@ Mesh::Mesh(Config config) : config(config)
 
     assert(m_fIsBoundary.size() == m_fNum);
 
+#ifdef DG_USE_MPI
+    if (Parallel::size() > 1)
+    {
+        classifyFaces();
+        buildHalo();
+        buildLocalFaceList();
+    }
+#endif
+
     /**
      * Extra Memory allocation:
      * Instantiate Ghost Elements and numerical flux storage.
@@ -685,17 +773,490 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
 }
 
+#ifdef DG_USE_MPI
+
+/**
+ * No-op stub: the new partition path sets m_localElStart/End and
+ * m_elOwnerRank directly from the gmsh PartitionLayout (see the
+ * MPI branch in Mesh::Mesh). This function used to do a balanced
+ * range partition over the GLOBAL element array, which has no
+ * meaning anymore now that each rank only loads its local + halo.
+ *
+ * Kept as a stub to avoid breaking the call site in Mesh::Mesh
+ * (already migrated, but the symbol is still declared in Mesh.h).
+ */
+void Mesh::partitionMesh()
+{
+    // intentionally empty
+}
+
+/**
+ * Classify each face as:
+ *  - boundary  : physical boundary (m_fIsBoundary already set)
+ *  - internal  : both neighbour elements belong to this rank
+ *  - interface : neighbours belong to different ranks
+ *
+ * Must be called after getConnectivityFaceToElement() and m_fIsBoundary are set.
+ */
+void Mesh::classifyFaces()
+{
+    int myRank = Parallel::rank();
+    m_fIsInterface.assign(m_fNum, false);
+    m_fNbrRank.assign(m_fNum, -1);
+
+    int nInterface = 0;
+    for (int f = 0; f < m_fNum; ++f)
+    {
+        if (m_fIsBoundary[f] || m_fNbrElIds[f].size() < 2)
+            continue;
+
+        int r0 = m_elOwnerRank[m_fNbrElIds[f][0]];
+        int r1 = m_elOwnerRank[m_fNbrElIds[f][1]];
+
+        // Only count faces where THIS rank owns one side. Otherwise (face
+        // between two remote ranks) it is none of our business — flagging it
+        // here would add foreign elements to our halo lists and break
+        // size symmetry with neighbours.
+        if (r0 != r1 && (r0 == myRank || r1 == myRank))
+        {
+            m_fIsInterface[f] = true;
+            m_fNbrRank[f]     = (r0 == myRank) ? r1 : r0;
+            ++nInterface;
+        }
+    }
+
+    std::cout << "[MPI rank " << myRank << "] "
+              << nInterface << " interface faces detected.\n" << std::flush;
+}
+
+/**
+ * Build halo send/receive element lists from the classified faces.
+ * For each interface face:
+ *   - the local element index goes into m_haloSendElIds[remoteRank]
+ *   - the remote element index goes into m_haloRecvElIds[remoteRank]
+ * Duplicates are avoided (an element adjacent to several interface faces
+ * with the same remote rank is only listed once).
+ */
+void Mesh::buildHalo()
+{
+    int myRank = Parallel::rank();
+
+    for (int f = 0; f < m_fNum; ++f)
+    {
+        if (!m_fIsInterface[f]) continue;
+
+        m_haloFaces.push_back(f);
+
+        size_t el0 = m_fNbrElIds[f][0];
+        size_t el1 = m_fNbrElIds[f][1];
+        int    r0  = m_elOwnerRank[el0];
+        int    r1  = m_elOwnerRank[el1];
+
+        size_t localEl  = (r0 == myRank) ? el0 : el1;
+        size_t remoteEl = (r0 == myRank) ? el1 : el0;
+        int    remRank  = m_fNbrRank[f];
+
+        auto &sendList = m_haloSendElIds[remRank];
+        if (std::find(sendList.begin(), sendList.end(), localEl) == sendList.end())
+            sendList.push_back(localEl);
+
+        auto &recvList = m_haloRecvElIds[remRank];
+        if (std::find(recvList.begin(), recvList.end(), remoteEl) == recvList.end())
+            recvList.push_back(remoteEl);
+    }
+
+    // Sort each halo list by GMSH GLOBAL TAG of the element. Both ranks of
+    // a pair sort the same way, so A's sendList[B][i] and B's recvList[A][i]
+    // refer to the SAME physical element. This makes haloExchange() a pure
+    // value transfer, no IDs needed.
+    auto sortByGmshTag = [&](std::vector<size_t> &lst) {
+        std::sort(lst.begin(), lst.end(),
+                  [&](size_t a, size_t b) { return m_elTags[a] < m_elTags[b]; });
+    };
+    for (auto &kv : m_haloSendElIds) sortByGmshTag(kv.second);
+    for (auto &kv : m_haloRecvElIds) sortByGmshTag(kv.second);
+
+    for (auto &[rank, elList] : m_haloSendElIds)
+        std::cout << "[MPI rank " << myRank << "] "
+                  << elList.size() << " elements to send to rank " << rank << "\n";
+    for (auto &[rank, elList] : m_haloRecvElIds)
+        std::cout << "[MPI rank " << myRank << "] "
+                  << elList.size() << " elements to receive from rank " << rank << "\n";
+    std::cout << std::flush;
+}
+
+/**
+ * Populate m_localFaces with every face index that has at least one local
+ * neighbour (an element in [0, m_localElEnd)). Faces with no local neighbour
+ * — typically halo-only outer faces — contribute to no local element's RHS,
+ * so precomputeFlux can skip them entirely.
+ *
+ * Must be called AFTER face connectivity (m_fNbrElIds) is set, which
+ * happens at the end of getConnectivityFaceToElement.
+ */
+void Mesh::buildLocalFaceList()
+{
+    m_localFaces.clear();
+    m_localFaces.reserve(m_fNum);
+    const size_t localEnd = static_cast<size_t>(m_localElEnd);
+    for (int f = 0; f < m_fNum; ++f)
+    {
+        for (size_t el : m_fNbrElIds[f])
+        {
+            if (el < localEnd) { m_localFaces.push_back(f); break; }
+        }
+    }
+    std::cout << "[MPI rank " << Parallel::rank() << "] "
+              << m_localFaces.size() << " local faces (of " << m_fNum << ")\n"
+              << std::flush;
+}
+
+/**
+ * Load elements (and their per-int-pt Jacobians/coordinates) for the
+ * calling rank, given a PartitionLayout. Concatenates owned elements
+ * first, then halo elements:
+ *   indices [0, Nloc)            → owned by this rank
+ *   indices [Nloc, Nloc + Nhalo) → halo (ghost) cells, owned by remote
+ *
+ * Outputs (passed by reference, cleared then filled):
+ *   elTags           : gmsh global element tags
+ *   elNodeTags       : (Nloc + Nhalo) * elNumNodes gmsh global node tags
+ *   jacobians        : (Nloc + Nhalo) * intPts * 9 doubles
+ *   jacobianDets     : (Nloc + Nhalo) * intPts doubles
+ *   intPtCoords      : (Nloc + Nhalo) * intPts * 3 doubles
+ *   haloOwnerRank    : size Nhalo, owner rank (0-based) of each halo element
+ *   nLocal           : Nloc
+ *   nHalo            : Nhalo
+ */
+static void loadElementsByPartition(const PartitionLayout &layout,
+                                    int elementType,
+                                    const std::vector<double> &integrationParamCoords,
+                                    std::vector<std::size_t> &elTags,
+                                    std::vector<std::size_t> &elNodeTags,
+                                    std::vector<double> &jacobians,
+                                    std::vector<double> &jacobianDets,
+                                    std::vector<double> &intPtCoords,
+                                    std::vector<int> &haloOwnerRank,
+                                    int &nLocal,
+                                    int &nHalo)
+{
+    elTags.clear();
+    elNodeTags.clear();
+    jacobians.clear();
+    jacobianDets.clear();
+    intPtCoords.clear();
+    haloOwnerRank.clear();
+
+    auto loadEntity = [&](int dim, int entTag) -> std::size_t
+    {
+        std::vector<std::size_t> et, ent;
+        gmsh::model::mesh::getElementsByType(elementType, et, ent, entTag);
+        if (et.empty()) return 0;
+
+        std::vector<double> jac, det, coords;
+        gmsh::model::mesh::getJacobians(elementType, integrationParamCoords,
+                                        jac, det, coords, entTag);
+
+        elTags.insert(elTags.end(), et.begin(), et.end());
+        elNodeTags.insert(elNodeTags.end(), ent.begin(), ent.end());
+        jacobians.insert(jacobians.end(), jac.begin(), jac.end());
+        jacobianDets.insert(jacobianDets.end(), det.begin(), det.end());
+        intPtCoords.insert(intPtCoords.end(), coords.begin(), coords.end());
+        return et.size();
+    };
+
+    // 1) Owned elements
+    nLocal = 0;
+    for (int entTag : layout.ownedEntities3D)
+        nLocal += static_cast<int>(loadEntity(3, entTag));
+
+    // 2) Halo elements + owner rank lookup
+    nHalo = 0;
+    for (int entTag : layout.haloEntities3D)
+    {
+        // Get the ghost-tag → owner-partition map for THIS halo entity
+        std::vector<std::size_t> ghostTags;
+        std::vector<int>         ghostParts;
+        gmsh::model::mesh::getGhostElements(3, entTag, ghostTags, ghostParts);
+        std::unordered_map<std::size_t, int> tagToOwner;
+        tagToOwner.reserve(ghostTags.size());
+        for (std::size_t i = 0; i < ghostTags.size(); ++i)
+            tagToOwner[ghostTags[i]] = ghostParts[i] - 1; // partitions are 1-based
+
+        const std::size_t before = elTags.size();
+        const std::size_t added  = loadEntity(3, entTag);
+        nHalo += static_cast<int>(added);
+
+        for (std::size_t i = 0; i < added; ++i)
+        {
+            auto it = tagToOwner.find(elTags[before + i]);
+            haloOwnerRank.push_back(it != tagToOwner.end() ? it->second : -1);
+        }
+    }
+}
+
+/**
+ * Concatenate barycenters owned-first then halo, in the same order as
+ * elTags returned by loadElementsByPartition.
+ */
+static void loadBarycentersByPartition(const PartitionLayout &layout,
+                                       int elementType,
+                                       std::vector<double> &barycenters)
+{
+    barycenters.clear();
+    auto add = [&](int dim, int entTag) {
+        std::vector<double> b;
+        gmsh::model::mesh::getBarycenters(elementType, entTag, false, true, b);
+        barycenters.insert(barycenters.end(), b.begin(), b.end());
+    };
+    for (int t : layout.ownedEntities3D) add(3, t);
+    for (int t : layout.haloEntities3D) add(3, t);
+}
+
+/**
+ * Concatenate per-element face (or edge) node tags owned-first then halo,
+ * in the same order as elTags. faceNumNodes = 4 (hex faces), 3 (tet faces),
+ * or use the edge-node API when faceNumNodes <= 0.
+ */
+static void loadFaceNodesByPartition(const PartitionLayout &layout,
+                                     int elementType,
+                                     int faceNumNodes,
+                                     std::vector<std::size_t> &fNodeTags)
+{
+    fNodeTags.clear();
+    auto add = [&](int dim, int entTag) {
+        std::vector<std::size_t> tmp;
+        if (faceNumNodes > 0)
+            gmsh::model::mesh::getElementFaceNodes(elementType, faceNumNodes, tmp, entTag);
+        else
+            gmsh::model::mesh::getElementEdgeNodes(elementType, tmp, entTag);
+        fNodeTags.insert(fNodeTags.end(), tmp.begin(), tmp.end());
+    };
+    for (int t : layout.ownedEntities3D) add(3, t);
+    for (int t : layout.haloEntities3D) add(3, t);
+}
+
+/**
+ * Run gmsh partitioning and classify entities for the calling rank.
+ * Idempotent: a second call on the same model does not partition again
+ * — gmsh is left as-is and we just re-read the existing entity layout.
+ *
+ * The function intentionally does NOT touch any Mesh member: it only
+ * inspects gmsh state and returns the layout struct. Plugging this
+ * into Mesh::Mesh() is the next step (3b).
+ */
+PartitionLayout buildPartitionLayout()
+{
+    const int myPart = Parallel::rank() + 1; // gmsh partition tags are 1-based
+    const int N      = Parallel::size();
+
+    // 1) Partition the mesh (only if not already partitioned).
+    //    Heuristic for "already partitioned": at least one 3D entity has
+    //    a non-empty partition list.
+    bool alreadyPartitioned = false;
+    {
+        std::vector<std::pair<int,int>> ents;
+        gmsh::model::getEntities(ents, 3);
+        for (auto &[d, t] : ents)
+        {
+            std::vector<int> ps;
+            gmsh::model::getPartitions(d, t, ps);
+            if (!ps.empty()) { alreadyPartitioned = true; break; }
+        }
+    }
+
+    if (!alreadyPartitioned)
+    {
+        gmsh::option::setNumber("Mesh.PartitionCreateGhostCells", 1);
+        gmsh::option::setNumber("Mesh.PartitionCreateTopology",   1);
+        gmsh::model::mesh::partition(N);
+    }
+
+    PartitionLayout layout;
+
+    // 2) Walk 3D entities. An entity belongs to this rank if its partition
+    //    list contains myPart. We then split owned vs halo by the presence
+    //    of ghost elements.
+    {
+        std::vector<std::pair<int,int>> ents;
+        gmsh::model::getEntities(ents, 3);
+        for (auto &[d, tag] : ents)
+        {
+            std::vector<int> partitions;
+            gmsh::model::getPartitions(d, tag, partitions);
+            if (std::find(partitions.begin(), partitions.end(), myPart) == partitions.end())
+                continue;
+
+            std::vector<std::size_t> ghostTags;
+            std::vector<int>         ghostParts;
+            gmsh::model::mesh::getGhostElements(d, tag, ghostTags, ghostParts);
+
+            if (ghostTags.empty())
+                layout.ownedEntities3D.push_back(tag);
+            else
+                layout.haloEntities3D.push_back(tag);
+        }
+    }
+
+    // 3) Walk 2D entities. Three categories:
+    //    - partitions = {myPart}        → physical boundary face of this rank
+    //    - partitions = {myPart, k}     → interface with rank k-1
+    //    - everything else              → not relevant for this rank
+    {
+        std::vector<std::pair<int,int>> ents;
+        gmsh::model::getEntities(ents, 2);
+        for (auto &[d, tag] : ents)
+        {
+            std::vector<int> partitions;
+            gmsh::model::getPartitions(d, tag, partitions);
+            if (partitions.empty()) continue;
+            if (std::find(partitions.begin(), partitions.end(), myPart) == partitions.end())
+                continue;
+
+            if (partitions.size() == 1)
+            {
+                layout.boundaryEntities2D.push_back(tag);
+            }
+            else if (partitions.size() == 2)
+            {
+                int otherPart = (partitions[0] == myPart) ? partitions[1] : partitions[0];
+                layout.interfaceEntitiesByRank[otherPart - 1].push_back(tag);
+            }
+            // size > 2 (triple junction etc.) is rare in practice; skip for now.
+        }
+    }
+
+    // 4) Diagnostics
+    {
+        size_t nOwnedEls = 0, nHaloEls = 0, nBdryFaces = 0, nInterfaceFaces = 0;
+        for (int tag : layout.ownedEntities3D)
+        {
+            std::vector<int> et;
+            std::vector<std::vector<std::size_t>> elt, nt;
+            gmsh::model::mesh::getElements(et, elt, nt, 3, tag);
+            for (auto &v : elt) nOwnedEls += v.size();
+        }
+        for (int tag : layout.haloEntities3D)
+        {
+            std::vector<int> et;
+            std::vector<std::vector<std::size_t>> elt, nt;
+            gmsh::model::mesh::getElements(et, elt, nt, 3, tag);
+            for (auto &v : elt) nHaloEls += v.size();
+        }
+        for (int tag : layout.boundaryEntities2D)
+        {
+            std::vector<int> et;
+            std::vector<std::vector<std::size_t>> elt, nt;
+            gmsh::model::mesh::getElements(et, elt, nt, 2, tag);
+            for (auto &v : elt) nBdryFaces += v.size();
+        }
+        for (auto &kv : layout.interfaceEntitiesByRank)
+            for (int tag : kv.second)
+            {
+                std::vector<int> et;
+                std::vector<std::vector<std::size_t>> elt, nt;
+                gmsh::model::mesh::getElements(et, elt, nt, 2, tag);
+                for (auto &v : elt) nInterfaceFaces += v.size();
+            }
+
+        std::cout << "[MPI rank " << Parallel::rank() << "] partition layout: "
+                  << nOwnedEls   << " owned 3D els, "
+                  << nHaloEls    << " halo 3D els, "
+                  << nBdryFaces  << " physical bdry faces, "
+                  << nInterfaceFaces << " interface faces"
+                  << " (" << layout.interfaceEntitiesByRank.size() << " neighbours)\n"
+                  << std::flush;
+    }
+
+    return layout;
+}
+
+#endif // DG_USE_MPI
+
+void Mesh::haloExchange(std::vector<std::vector<double>> &u)
+{
+#ifdef DG_USE_MPI
+    if (Parallel::size() <= 1)
+        return;
+
+    std::set<int> neighbours;
+    for (const auto &entry : m_haloSendElIds)
+        neighbours.insert(entry.first);
+    for (const auto &entry : m_haloRecvElIds)
+        neighbours.insert(entry.first);
+
+    const int fieldCount = static_cast<int>(u.size());
+    const int dofsPerEl = m_elNumNodes;
+
+    // Halo lists are sorted by gmsh element tag at construction time
+    // (see buildHalo). So A's sendList[B][i] and B's recvList[A][i]
+    // refer to the SAME physical element — no IDs need to be exchanged.
+    for (int neighbourRank : neighbours)
+    {
+        const auto sendIt = m_haloSendElIds.find(neighbourRank);
+        const auto recvIt = m_haloRecvElIds.find(neighbourRank);
+
+        const std::vector<size_t> emptyEls;
+        const std::vector<size_t> &sendEls = (sendIt != m_haloSendElIds.end()) ? sendIt->second : emptyEls;
+        const std::vector<size_t> &recvEls = (recvIt != m_haloRecvElIds.end()) ? recvIt->second : emptyEls;
+
+        std::vector<double> sendValues(sendEls.size() * fieldCount * dofsPerEl);
+        std::vector<double> recvValues(recvEls.size() * fieldCount * dofsPerEl);
+
+        size_t sendOffset = 0;
+        for (size_t elIndex = 0; elIndex < sendEls.size(); ++elIndex)
+        {
+            const size_t el = sendEls[elIndex]; // local owned-region index
+            for (int eq = 0; eq < fieldCount; ++eq)
+            {
+                std::copy_n(u[eq].begin() + el * dofsPerEl,
+                            dofsPerEl,
+                            sendValues.begin() + sendOffset);
+                sendOffset += dofsPerEl;
+            }
+        }
+
+        MPI_Sendrecv(sendValues.data(), static_cast<int>(sendValues.size()), MPI_DOUBLE, neighbourRank, 4101,
+                     recvValues.data(), static_cast<int>(recvValues.size()), MPI_DOUBLE, neighbourRank, 4101,
+                     Parallel::comm(), MPI_STATUS_IGNORE);
+
+        size_t recvOffset = 0;
+        for (size_t elIndex = 0; elIndex < recvEls.size(); ++elIndex)
+        {
+            const size_t el = recvEls[elIndex]; // local halo-region index
+            for (int eq = 0; eq < fieldCount; ++eq)
+            {
+                std::copy_n(recvValues.begin() + recvOffset,
+                            dofsPerEl,
+                            u[eq].begin() + el * dofsPerEl);
+                recvOffset += dofsPerEl;
+            }
+        }
+    }
+#else
+    (void)u;
+#endif
+}
+
 /**
  * Precompute and store the mass matris for all elements in m_elMassMatrix
  */
 void Mesh::precomputeMassMatrix()
 {
     m_elMassMatrices.resize(m_elNum * m_elNumNodes * m_elNumNodes);
-    // #pragma omp parallel for
-    for (size_t el = 0; el < m_elNum; ++el)
+    // Only local elements need an inverse mass matrix: numStep updates only
+    // [m_localElStart, m_localElEnd). Halo cells are read-only (overwritten
+    // by haloExchange).
+#ifdef DG_USE_MPI
+    if (Parallel::size() > 1)
     {
-        getElMassMatrix(el, true, &elMassMatrix(el));
+        for (int el = m_localElStart; el < m_localElEnd; ++el)
+            getElMassMatrix(el, true, &elMassMatrix(el));
+        return;
     }
+#endif
+    for (size_t el = 0; el < m_elNum; ++el)
+        getElMassMatrix(el, true, &elMassMatrix(el));
 }
 
 /**
@@ -760,6 +1321,16 @@ void Mesh::getElStiffVector(const size_t el, std::vector<std::vector<double>> &F
  */
 void Mesh::precomputeFlux(std::vector<double> &u, std::vector<std::vector<double>> &Flux, int eq)
 {
+    // In MPI mode, only iterate over faces touching at least one local
+    // element. Faces with no local neighbour contribute to no local
+    // element's getElFlux → wasted work that scales with the halo size.
+#ifdef DG_USE_MPI
+    const bool useLocalFaces = (Parallel::size() > 1);
+    const int nFacesToProcess = useLocalFaces ? static_cast<int>(m_localFaces.size())
+                                              : m_fNum;
+#else
+    const int nFacesToProcess = m_fNum;
+#endif
 
 #pragma omp parallel num_threads(config.numThreads)
     {
@@ -769,12 +1340,20 @@ void Mesh::precomputeFlux(std::vector<double> &u, std::vector<std::vector<double
         std::vector<double> Fnum(m_Dim, 0);
 
 #pragma omp parallel for schedule(static)
-        for (int f = 0; f < m_fNum; ++f)
+        for (int kf = 0; kf < nFacesToProcess; ++kf)
         {
+#ifdef DG_USE_MPI
+            const int f = useLocalFaces ? static_cast<int>(m_localFaces[kf]) : kf;
+#else
+            const int f = kf;
+#endif
 
             std::fill(FIntPts.begin(), FIntPts.end(), 0);
 
-            // Numerical Flux at Integration points
+            // Numerical Flux at Integration points.
+            // Interface faces (MPI) are NOT special-cased: after haloExchange,
+            // u[halo] is valid and updateFlux fills Flux[halo] for the full element
+            // range — so the standard interior Rusanov path applies.
             if (m_fIsBoundary[f])
             {
                 for (int g = 0; g < m_fNumIntPts; ++g)
@@ -972,6 +1551,64 @@ void Mesh::updateFlux(std::vector<std::vector<double>> &u, std::vector<std::vect
             }
         }
     }
+
+#ifdef DG_USE_MPI
+    if (Parallel::size() > 1)
+    {
+#pragma omp parallel for schedule(static) num_threads(config.numThreads)
+        for (int fId = 0; fId < m_fNum; ++fId)
+        {
+            if (!m_fIsInterface[fId])
+                continue;
+
+            const size_t el0 = fNbrElId(fId, 0);
+            const size_t el1 = fNbrElId(fId, 1);
+
+            for (int g = 0; g < m_fNumIntPts; ++g)
+            {
+                const int gId = fId * m_fNumIntPts + g;
+                double u0[4] = {0.0, 0.0, 0.0, 0.0};
+                double u1[4] = {0.0, 0.0, 0.0, 0.0};
+
+                for (int n = 0; n < m_fNumNodes; ++n)
+                {
+                    const size_t n0 = el0 * m_elNumNodes + fNToElNId(fId, n, 0);
+                    const size_t n1 = el1 * m_elNumNodes + fNToElNId(fId, n, 1);
+                    const double basis = fBasisFct(g, n);
+
+                    for (int eq = 0; eq < 4; ++eq)
+                    {
+                        u0[eq] += u[eq][n0] * basis;
+                        u1[eq] += u[eq][n1] * basis;
+                    }
+                }
+
+                const double nx = fNormal(fId, g, 0);
+                const double ny = fNormal(fId, g, 1);
+                const double nz = fNormal(fId, g, 2);
+
+                const double flux0[4][3] = {
+                    {v0[0] * u0[0] + rho0 * c0 * c0 * u0[1], v0[1] * u0[0] + rho0 * c0 * c0 * u0[2], v0[2] * u0[0] + rho0 * c0 * c0 * u0[3]},
+                    {v0[0] * u0[1] + u0[0] / rho0, v0[1] * u0[1], v0[2] * u0[1]},
+                    {v0[0] * u0[2], v0[1] * u0[2] + u0[0] / rho0, v0[2] * u0[2]},
+                    {v0[0] * u0[3], v0[1] * u0[3], v0[2] * u0[3] + u0[0] / rho0}};
+
+                const double flux1[4][3] = {
+                    {v0[0] * u1[0] + rho0 * c0 * c0 * u1[1], v0[1] * u1[0] + rho0 * c0 * c0 * u1[2], v0[2] * u1[0] + rho0 * c0 * c0 * u1[3]},
+                    {v0[0] * u1[1] + u1[0] / rho0, v0[1] * u1[1], v0[2] * u1[1]},
+                    {v0[0] * u1[2], v0[1] * u1[2] + u1[0] / rho0, v0[2] * u1[2]},
+                    {v0[0] * u1[3], v0[1] * u1[3], v0[2] * u1[3] + u1[0] / rho0}};
+
+                for (int eq = 0; eq < 4; ++eq)
+                {
+                    const double proj0 = nx * flux0[eq][0] + ny * flux0[eq][1] + nz * flux0[eq][2];
+                    const double proj1 = nx * flux1[eq][0] + ny * flux1[eq][1] + nz * flux1[eq][2];
+                    FluxGhost[eq][gId][0] = 0.5 * ((proj0 + proj1) + fc * config.c0 * (u0[eq] - u1[eq]));
+                }
+            }
+        }
+    }
+#endif
 }
 
 /**
@@ -980,6 +1617,16 @@ void Mesh::updateFlux(std::vector<std::vector<double>> &u, std::vector<std::vect
 
 void Mesh::getUniqueFaceNodeTags()
 {
+    const bool hasQuadrilateralFaces = (m_fDim == 2 && m_fName == "quadrangle");
+    auto hasSameNativeNodes = [](const std::vector<size_t> &lhs, const std::vector<size_t> &rhs, size_t nativeCount)
+    {
+        std::vector<size_t> lhsNative(lhs.begin(), lhs.begin() + nativeCount);
+        std::vector<size_t> rhsNative(rhs.begin(), rhs.begin() + nativeCount);
+        std::sort(lhsNative.begin(), lhsNative.end());
+        std::sort(rhsNative.begin(), rhsNative.end());
+        return std::equal(lhsNative.begin(), lhsNative.end(), rhsNative.begin());
+    };
+
     // Ordering per face for efficient comparison
     m_elFNodeTagsOrdered = m_elFNodeTags;
     // #pragma omp parallel for
@@ -1026,8 +1673,8 @@ void Mesh::getUniqueFaceNodeTags()
         screen_display::write_string("Create and get all faces", BLUE);
         std::vector<size_t> face_tags;
         gmsh::model::mesh::createFaces();
-        gmsh::model::mesh::getAllFaces(3, face_tags, m_fNodeTags_t);
-        fNumNativeNodes = 3;
+        gmsh::model::mesh::getAllFaces(hasQuadrilateralFaces ? 4 : 3, face_tags, m_fNodeTags_t);
+        fNumNativeNodes = hasQuadrilateralFaces ? 4 : 3;
 
         std::vector<std::vector<size_t>> m_fNodeTags_tab_full = vector_to_matrix(m_fNodeTags, m_fNumNodes);
         std::vector<std::vector<size_t>> m_fNodeTags_t_tab = vector_to_matrix(m_fNodeTags_t, fNumNativeNodes);
@@ -1036,7 +1683,7 @@ void Mesh::getUniqueFaceNodeTags()
         {
             for (size_t j = 0; j < m_fNodeTags_t_tab.size(); j++)
             {
-                if (isNCoincidentValues3d(m_fNodeTags_tab_full[i], m_fNodeTags_t_tab[j]))
+                if (hasSameNativeNodes(m_fNodeTags_tab_full[i], m_fNodeTags_t_tab[j], fNumNativeNodes))
                 {
                     m_fNodeTags_tab.push_back(m_fNodeTags_tab_full[i]);
                     erase_row_from_matrix(m_fNodeTags_t_tab, j);
@@ -1138,45 +1785,108 @@ void Mesh::writeVTUb(std::string filename, std::vector<std::vector<double>> &u)
     // std::string filename = filename;
     screen_display::write_string("Write VTU: " + filename, BOLDRED);
 
-    size_t eltype;
-    std::vector<size_t> node_tag;
-    std::vector<double> coord_tmp;
-    std::vector<double> param_coord_tmp;
-    gmsh::model::mesh::getNodes(node_tag, coord_tmp, param_coord_tmp);
-    coord_tmp.clear();
-    param_coord_tmp.clear();
+    int vtkCellType = VTK_EMPTY_CELL;
+    size_t vtkCellNumNodes = 0;
 
-    size_t elNumNodes = (m_elDim == 2) ? 3 : 4; //! 3 points: triangle , 4 points : tetrahedral
+    if (m_elName.find("Quadrilateral") != std::string::npos)
+    {
+        vtkCellType = VTK_QUAD;
+        vtkCellNumNodes = 4;
+    }
+    else if (m_elName.find("Hexahedron") != std::string::npos)
+    {
+        vtkCellType = VTK_HEXAHEDRON;
+        vtkCellNumNodes = 8;
+    }
+    else if (m_elName.find("Triangle") != std::string::npos)
+    {
+        vtkCellType = VTK_TRIANGLE;
+        vtkCellNumNodes = 3;
+    }
+    else if (m_elName.find("Tetrahedron") != std::string::npos)
+    {
+        vtkCellType = VTK_TETRA;
+        vtkCellNumNodes = 4;
+    }
+    else
+    {
+        Fatal_Error("Unsupported VTU cell type");
+    }
 
     vtkNew<vtkPoints> points;
+    points->SetDataTypeToDouble();
 
     vtkNew<vtkCellArray> cellArray;
     vtkNew<vtkDoubleArray> pressure, density, velocity;
     vtkNew<vtkUnstructuredGrid> unstructuredGrid;
     vtkNew<vtkXMLUnstructuredGridWriter> writer;
 
-    for (auto n : node_tag)
+        const size_t elBegin =
+    #ifdef DG_USE_MPI
+        (Parallel::size() > 1) ? static_cast<size_t>(m_localElStart) : 0;
+    #else
+        0;
+    #endif
+        const size_t elEnd =
+    #ifdef DG_USE_MPI
+        (Parallel::size() > 1) ? static_cast<size_t>(m_localElEnd) : static_cast<size_t>(getElNum());
+    #else
+        static_cast<size_t>(getElNum());
+    #endif
+
+    std::vector<size_t> usedNodeTags;
+        usedNodeTags.reserve((elEnd - elBegin) * vtkCellNumNodes);
+    std::unordered_map<size_t, vtkIdType> vtkPointIdByNodeTag;
+
+        for (size_t el = elBegin; el < elEnd; ++el)
+    {
+        for (size_t n = 0; n < vtkCellNumNodes; ++n)
+        {
+            const size_t nodeTag = elNodeTag(el, n);
+            if (vtkPointIdByNodeTag.find(nodeTag) == vtkPointIdByNodeTag.end())
+            {
+                vtkPointIdByNodeTag[nodeTag] = static_cast<vtkIdType>(usedNodeTags.size());
+                usedNodeTags.push_back(nodeTag);
+            }
+        }
+    }
+
+    for (size_t nodeTag : usedNodeTags)
     {
         std::vector<double> coord, paramCoord;
         int _dim, _tag;
-        gmsh::model::mesh::getNode(n, coord, paramCoord, _dim, _tag);
+        gmsh::model::mesh::getNode(nodeTag, coord, paramCoord, _dim, _tag);
         points->InsertNextPoint(coord[0], coord[1], coord[2]);
     }
 
-    for (size_t i = 0; i < getElNum(); i++)
+    for (size_t i = elBegin; i < elEnd; i++)
     {
+        vtkNew<vtkHexahedron> hexa;
+        vtkNew<vtkQuad> quad;
         vtkNew<vtkTetra> tetra;
         vtkNew<vtkTriangle> tri;
-        for (size_t j = 0; j < elNumNodes; j++) /*getElNumNodes()*/
+        for (size_t j = 0; j < vtkCellNumNodes; j++)
         {
-            if (m_elDim == 3)
-                tetra->GetPointIds()->SetId(j, elNodeTag(i, j) - 1);
+            const auto pointIt = vtkPointIdByNodeTag.find(elNodeTag(i, j));
+            if (pointIt == vtkPointIdByNodeTag.end())
+                Fatal_Error("VTU writer node mapping error");
+
+            if (vtkCellType == VTK_HEXAHEDRON)
+                hexa->GetPointIds()->SetId(j, pointIt->second);
+            else if (vtkCellType == VTK_TETRA)
+                tetra->GetPointIds()->SetId(j, pointIt->second);
+            else if (vtkCellType == VTK_QUAD)
+                quad->GetPointIds()->SetId(j, pointIt->second);
             else
-                tri->GetPointIds()->SetId(j, elNodeTag(i, j) - 1);
+                tri->GetPointIds()->SetId(j, pointIt->second);
         }
 
-        if (m_elDim == 3)
+        if (vtkCellType == VTK_HEXAHEDRON)
+            cellArray->InsertNextCell(hexa);
+        else if (vtkCellType == VTK_TETRA)
             cellArray->InsertNextCell(tetra);
+        else if (vtkCellType == VTK_QUAD)
+            cellArray->InsertNextCell(quad);
         else
             cellArray->InsertNextCell(tri);
     }
@@ -1186,14 +1896,7 @@ void Mesh::writeVTUb(std::string filename, std::vector<std::vector<double>> &u)
     velocity->SetName("Velocity [m/s]");
     velocity->SetNumberOfComponents(3);
 
-    std::vector<size_t> nb_occurence(node_tag.size(), 1);
-    std::vector<double> pressure_vec(node_tag.size(), 0.0);
-    std::vector<double> density_vec(node_tag.size(), 0.0);
-    std::vector<double> vel_x_vec(node_tag.size(), 0.0);
-    std::vector<double> vel_y_vec(node_tag.size(), 0.0);
-    std::vector<double> vel_z_vec(node_tag.size(), 0.0);
-
-    for (size_t el = 0; el < getElNum(); ++el)
+    for (size_t el = elBegin; el < elEnd; ++el)
     {
         double p(0.0), rho(0.0), vx(0.0), vy(0.0), vz(0.0);
         for (size_t n = 0; n < getElNumNodes(); ++n)
@@ -1213,10 +1916,7 @@ void Mesh::writeVTUb(std::string filename, std::vector<std::vector<double>> &u)
 
     unstructuredGrid->SetPoints(points);
 
-    if (m_elDim == 3)
-        unstructuredGrid->SetCells(VTK_TETRA, cellArray);
-    else
-        unstructuredGrid->SetCells(VTK_TRIANGLE, cellArray);
+    unstructuredGrid->SetCells(vtkCellType, cellArray);
 
     unstructuredGrid->GetCellData()->AddArray(pressure);
     unstructuredGrid->GetCellData()->AddArray(density);
@@ -1229,10 +1929,42 @@ void Mesh::writeVTUb(std::string filename, std::vector<std::vector<double>> &u)
     writer->Write();
 }
 
+void Mesh::writePVTUb(std::string filename)
+{
+    screen_display::write_string("Write PVTU: " + filename, BOLDRED);
+
+    std::ofstream file(filename.c_str(), std::ios::trunc);
+    const size_t slashPos = filename.find_last_of("/\\");
+    const std::string baseName = (slashPos == std::string::npos) ? filename : filename.substr(slashPos + 1);
+    const size_t dotPos = baseName.find_last_of('.');
+    const std::string stem = (dotPos == std::string::npos) ? baseName : baseName.substr(0, dotPos);
+
+    file << "<?xml version=\"1.0\"?>" << std::endl;
+    file << "<VTKFile type=\"PUnstructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\" header_type=\"UInt32\">" << std::endl;
+    file << "  <PUnstructuredGrid GhostLevel=\"0\">" << std::endl;
+    file << "    <PCellData>" << std::endl;
+    file << "      <PDataArray type=\"Float64\" Name=\"Pressure [Pa]\"/>" << std::endl;
+    file << "      <PDataArray type=\"Float64\" Name=\"Density [kg/m³]\"/>" << std::endl;
+    file << "      <PDataArray type=\"Float64\" Name=\"Velocity [m/s]\" NumberOfComponents=\"3\"/>" << std::endl;
+    file << "    </PCellData>" << std::endl;
+    file << "    <PPoints>" << std::endl;
+    file << "      <PDataArray type=\"Float64\" NumberOfComponents=\"3\"/>" << std::endl;
+    file << "    </PPoints>" << std::endl;
+
+    for (int rank = 0; rank < Parallel::size(); ++rank)
+    {
+        file << "    <Piece Source=\"" << stem << "_rank" << rank << ".vtu\"/>" << std::endl;
+    }
+
+    file << "  </PUnstructuredGrid>" << std::endl;
+    file << "</VTKFile>" << std::endl;
+    file.close();
+}
+
 void Mesh::writePVD(std::string filename)
 {
     screen_display::write_string("Write PVD at " + filename, BOLDRED);
-    std::ofstream file(filename.c_str(), std::ios_base::ate);
+    std::ofstream file(filename.c_str(), std::ios::trunc);
 
     file << "<VTKFile type=\"Collection\" version=\"1.0\" byte_order=\"LittleEndian\" header_type=\"UInt64\">" << std::endl;
     file << "  <Collection>" << std::endl;
@@ -1242,8 +1974,11 @@ void Mesh::writePVD(std::string filename)
         if (tDisplay >= config.timeRate || step == 0)
         {
             tDisplay = 0;
-            std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
-            file << "    <DataSet timestep=\"" << t << "\" part=\"0\" file=\"" << vtu_filename << "\"/>" << std::endl;
+            std::string vtu_filename = "results/result" + std::to_string((int)step);
+            if (Parallel::size() > 1)
+                file << "    <DataSet timestep=\"" << t << "\" part=\"0\" file=\"" << vtu_filename << ".pvtu\"/>" << std::endl;
+            else
+                file << "    <DataSet timestep=\"" << t << "\" part=\"0\" file=\"" << vtu_filename << ".vtu\"/>" << std::endl;
         }
     }
     file << "  </Collection>" << std::endl;

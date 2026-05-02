@@ -1,0 +1,69 @@
+{
+	"mesh": {
+		"File": "tests/cube.msh",
+		"BC": {
+			"number": 2,
+			"boundary1": {
+				"name": "abs",
+				"type": "Absorbing"
+			},
+			"boundary2": {
+				"name": "ref",
+				"type": "Reflecting"
+			}
+		}
+	},
+	"solver": {
+		"time": {
+			"start": 0.0,
+			"end": 0.05,
+			"step": 5e-04,
+			"rate": 0.01
+		},
+		"elementType": "Lagrange",
+		"timeIntMethod": "Runge-Kutta",
+		"numThreads": 4
+	},
+	"initialization": {
+		"meanFlow": {
+			"vx": 0.0,
+			"vy": 0.0,
+			"vz": 0.0,
+			"rho": 1.225,
+			"c": 340.0
+		},
+		"number": 1,
+		"initialCondition1": {
+			"type": "gaussian",
+			"x": 50.0,
+			"y": 50.0,
+			"z": 50.0,
+			"size": 500.0,
+			"amplitude": 1.0
+		}
+	},
+	"observers": {
+		"number": 1,
+		"observer1": {
+			"x": 80.0,
+			"y": 50.0,
+			"z": 50.0,
+			"size": 20.0
+		}
+	},
+	"sources": {
+		"number": 0,
+		"source1": {
+			"type": "formula",
+			"fct": "0.0",
+			"x": 0.0,
+			"y": 0.0,
+			"z": 0.0,
+			"size": 0.0,
+			"amplitude": 0.0,
+			"frequency": 0.0,
+			"phase": 0.0,
+			"duration": 0.0
+		}
+	}
+}

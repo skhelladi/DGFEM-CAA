@@ -44,6 +44,7 @@ if [ "$OS" = "Darwin" ]; then
 	brew_install fftw
 	brew_install nlohmann-json
 	brew_install eigen
+	brew_install mpich
 
 else
 	# Linux: use apt-get
@@ -138,6 +139,15 @@ else
 		sudo apt-get -y install libeigen3-dev;
 		echo "Eigen installed.";
 	fi
+
+	dpkg -s libopenmpi-dev > /dev/null 2>&1;
+	if [ $? -eq 0 ]; then
+		echo "OpenMPI found.";
+	else
+		echo "OpenMPI not found, installing...";
+		sudo apt-get -y install libopenmpi-dev openmpi-bin;
+		echo "OpenMPI installed.";
+	fi
 fi
 
 gmsh_version=4.15.2
@@ -187,8 +197,24 @@ echo "[2] Build sources.";
 rm -rf build/
 mkdir build
 
+# Set DG_USE_MPI=ON to enable MPI parallelization (default: OFF)
+DG_USE_MPI=${DG_USE_MPI:-OFF}
+
+MPI_CMAKE_ARGS=""
+if [ "$DG_USE_MPI" = "ON" ]; then
+	if ! command -v mpicc > /dev/null 2>&1 || ! command -v mpicxx > /dev/null 2>&1 || ! command -v mpirun > /dev/null 2>&1; then
+		echo "MPI toolchain not found in PATH (mpicc/mpicxx/mpirun required).";
+		exit 1;
+	fi
+	MPI_CMAKE_ARGS="-DMPI_C_COMPILER=$(command -v mpicc) -DMPI_CXX_COMPILER=$(command -v mpicxx) -DMPIEXEC_EXECUTABLE=$(command -v mpirun)"
+	echo "Using MPI toolchain:";
+	echo "  mpicc  = $(command -v mpicc)";
+	echo "  mpicxx = $(command -v mpicxx)";
+	echo "  mpirun = $(command -v mpirun)";
+fi
+
 cd build/
-cmake ../ -DCMAKE_BUILD_TYPE=Release  -G "Unix Makefiles"
+cmake ../ -DCMAKE_BUILD_TYPE=Release -DDG_USE_MPI=${DG_USE_MPI} ${MPI_CMAKE_ARGS} -G "Unix Makefiles"
 make -j
 if [ $? -eq 0 ]; then
     	echo "[end] Everything went successfully.";

@@ -1,14 +1,5 @@
 <VTKFile type="Collection" version="1.0" byte_order="LittleEndian" header_type="UInt64">
   <Collection>
-    <DataSet timestep="0" part="0" file="results/result0.vtu"/>
-    <DataSet timestep="0.1" part="0" file="results/result100.vtu"/>
-    <DataSet timestep="0.2" part="0" file="results/result200.vtu"/>
-    <DataSet timestep="0.3" part="0" file="results/result300.vtu"/>
-    <DataSet timestep="0.4" part="0" file="results/result400.vtu"/>
-    <DataSet timestep="0.5" part="0" file="results/result500.vtu"/>
-    <DataSet timestep="0.6" part="0" file="results/result600.vtu"/>
-    <DataSet timestep="0.7" part="0" file="results/result700.vtu"/>
-    <DataSet timestep="0.8" part="0" file="results/result800.vtu"/>
-    <DataSet timestep="0.9" part="0" file="results/result900.vtu"/>
+    <DataSet timestep="0" part="0" file="results/result0.pvtu"/>
   </Collection>
 </VTKFile>

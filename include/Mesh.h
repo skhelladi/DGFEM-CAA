@@ -23,9 +23,11 @@
 //! VTK headers
 #include <vtkCellArray.h>
 #include <vtkDoubleArray.h>
+#include <vtkHexahedron.h>
 #include <vtkNew.h>
 #include <vtkPointData.h>
 #include <vtkCellData.h>
+#include <vtkQuad.h>
 #include <vtkTetra.h>
 #include <vtkTriangle.h>
 #include <vtkUnstructuredGrid.h>
@@ -33,6 +35,8 @@
 
 #ifndef DGALERKIN_MESH_H
 #define DGALERKIN_MESH_H
+
+#include "Parallel.h"
 
 class Mesh
 {
@@ -175,22 +179,34 @@ public:
     /**
      * Extra getters
      */
-    int getNumNodes()
+    int getNumNodes() const
     {
         return m_elNodeTags.size();
     }
-    int getElNumNodes()
+    int getElNumNodes() const
     {
         return m_elNumNodes;
     }
-    int getElNum()
+    int getElNum() const
     {
         return m_elNum;
     }
-    std::vector<size_t> const &getElNodeTags()
+    std::vector<size_t> const &getElNodeTags() const
     {
         return m_elNodeTags;
     }
+
+#ifdef DG_USE_MPI
+    int getLocalElStart() const { return m_localElStart; }
+    int getLocalElEnd()   const { return m_localElEnd; }
+    int getElOwnerRank(size_t el) const { return m_elOwnerRank[el]; }
+    bool fIsInterface(int f)    const { return m_fIsInterface[f]; }
+    int  fNbrRank(int f)        const { return m_fNbrRank[f]; }
+
+    const std::map<int, std::vector<size_t>> &getHaloSendElIds() const { return m_haloSendElIds; }
+    const std::map<int, std::vector<size_t>> &getHaloRecvElIds() const { return m_haloRecvElIds; }
+    const std::vector<size_t>               &getHaloFaces()     const { return m_haloFaces; }
+#endif
 
     /**
      * Matrices and vectors assembly
@@ -206,6 +222,7 @@ public:
                           std::vector<double> &u, double *elStiffVector);
     void updateFlux(std::vector<std::vector<double>> &u, std::vector<std::vector<std::vector<double>>> &Flux,
                     std::vector<double> &v0, double c0, double rho0);
+    void haloExchange(std::vector<std::vector<double>> &u);
 
     /**
      * @brief Write VTK
@@ -213,6 +230,7 @@ public:
      */
     // void writeVTU(std::string filename, std::vector<std::vector<double>> &u);
     void writeVTUb(std::string filename, std::vector<std::vector<double>> &u);
+    void writePVTUb(std::string filename);
     void writePVD(std::string filename);
 
 private:
@@ -306,7 +324,81 @@ private:
 
     std::vector<std::vector<double>> uGhost;                 // Ghost element nodal solution
     std::vector<std::vector<std::vector<double>>> FluxGhost; // Ghost flux
+
+#ifdef DG_USE_MPI
+    // --- MPI partition ---
+    // Element ownership: rank p owns elements [m_localElStart, m_localElEnd)
+    std::vector<int> m_elOwnerRank;   // owning rank for each element (global index)
+    int              m_localElStart = 0;
+    int              m_localElEnd   = 0;
+
+    // Face classification (set in classifyFaces)
+    std::vector<bool> m_fIsInterface; // true when face separates two different ranks
+    std::vector<int>  m_fNbrRank;    // remote rank for interface faces, -1 otherwise
+
+    // Halo send/recv lists — indexed by neighbour rank
+    // Values are 0-based element indices into m_elTags / m_elNodeTags
+    std::map<int, std::vector<size_t>> m_haloSendElIds; // local elements to send
+    std::map<int, std::vector<size_t>> m_haloRecvElIds; // remote element indices to receive
+    std::vector<size_t>                m_haloFaces;      // face indices that are interfaces
+
+    // Faces having at least one neighbour in [0, m_localElEnd). Faces with
+    // no local neighbour (i.e. halo-only faces) contribute to no local
+    // element's right-hand side → skipped by precomputeFlux.
+    std::vector<size_t> m_localFaces;
+
+    void partitionMesh();   // balanced range partition of elements
+    void classifyFaces();   // tag faces as internal / interface / boundary
+    void buildHalo();       // populate m_haloSend/RecvElIds and m_haloFaces
+    void buildLocalFaceList(); // populate m_localFaces (after connectivity)
+#endif
 };
+
+#ifdef DG_USE_MPI
+/**
+ * Layout of a partitioned mesh as gmsh exposes it after `partition(N)`
+ * with `Mesh.PartitionCreateGhostCells = 1`.
+ *
+ * For a given rank r (= gmsh partition r+1):
+ *  - ownedEntities[3]   : 3D entity tags whose partitions == [r+1] AND
+ *                          have NO ghosts (i.e. these are the local elements)
+ *  - haloEntities[3]    : 3D entity tags whose partitions == [r+1] AND
+ *                          DO have ghosts (these are the halo / ghost cells)
+ *  - boundaryEntities[2]: 2D entity tags whose partitions == [r+1] (only)
+ *                          → physical boundary faces of this rank
+ *  - interfaceEntities[2]: map from neighbour rank (k) → list of 2D entity
+ *                          tags whose partitions == sorted([r+1, k+1])
+ *                          → faces shared between rank r and rank k
+ *  - haloOwnerRank      : for each ghost element tag in haloEntities[3],
+ *                          the gmsh partition tag of its owner (= remote rank +1).
+ *                          Same length and order as the concatenation of
+ *                          getElements()/getGhostElements() over haloEntities[3].
+ *
+ * This struct is the SOLE point that talks to the gmsh partition API.
+ * Everything downstream (Mesh constructor) consumes this layout in
+ * terms of gmsh element tags and entity tags.
+ */
+struct PartitionLayout
+{
+    std::vector<int> ownedEntities3D;   // 3D entities of locally owned elements
+    std::vector<int> haloEntities3D;    // 3D entities of ghost elements
+    std::vector<int> boundaryEntities2D; // physical boundary faces (rank-only)
+
+    // interfaceEntitiesByRank[k] = list of 2D entity tags whose partitions
+    // are exactly {r+1, k+1}. Used to detect halo neighbours.
+    std::map<int, std::vector<int>> interfaceEntitiesByRank;
+};
+
+/**
+ * Run gmsh::model::mesh::partition(N) (idempotent — re-using an
+ * already-partitioned mesh is allowed) and classify the resulting
+ * entities for the calling rank. Returns the layout.
+ *
+ * Pre: gmsh::open() has been called and the mesh is loaded.
+ * Pre: Parallel::size() > 1 and Parallel::rank() is valid.
+ */
+PartitionLayout buildPartitionLayout();
+#endif // DG_USE_MPI
 
 //! Tables operation functions
 

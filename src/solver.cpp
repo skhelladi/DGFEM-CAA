@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "Mesh.h"
+#include "Parallel.h"
 #include "configParser.h"
 
 namespace solver
@@ -25,6 +26,24 @@ namespace solver
 
     std::vector<std::vector<float>> data4wave;
 
+    int localElBegin(const Mesh &mesh)
+    {
+#ifdef DG_USE_MPI
+        if (Parallel::size() > 1)
+            return mesh.getLocalElStart();
+#endif
+        return 0;
+    }
+
+    int localElEnd(const Mesh &mesh)
+    {
+#ifdef DG_USE_MPI
+        if (Parallel::size() > 1)
+            return mesh.getLocalElEnd();
+#endif
+        return mesh.getElNum();
+    }
+
     /**
      * Perform a numerical step: u[t+1] = dt*M^-1*(S[u[t]]-F[u[t]]) + beta*u[t]
      * for all elements in mesh object.
@@ -38,13 +57,15 @@ namespace solver
     void numStep(Mesh &mesh, Config config, std::vector<std::vector<double>> &u,
                  std::vector<std::vector<std::vector<double>>> &Flux, double beta)
     {
+        const int elBegin = localElBegin(mesh);
+        const int elEnd = localElEnd(mesh);
 
         for (int eq = 0; eq < 4; ++eq)
         {
             mesh.precomputeFlux(u[eq], Flux[eq], eq);
 
 #pragma omp parallel for schedule(static) firstprivate(elFlux, elStiffvector) num_threads(config.numThreads)
-            for (int el = 0; el < mesh.getElNum(); ++el)
+            for (int el = elBegin; el < elEnd; ++el)
             {
 
                 mesh.getElFlux(el, elFlux.data());
@@ -65,6 +86,9 @@ namespace solver
      */
     void forwardEuler(std::vector<std::vector<double>> &u, Mesh &mesh, Config config)
     {
+        const bool rootRank = Parallel::isRoot();
+        const int elBegin = localElBegin(mesh);
+        const int elEnd = localElEnd(mesh);
 
         /** Memory allocation */
         elNumNodes = mesh.getElNumNodes();
@@ -137,18 +161,27 @@ namespace solver
         /**
          * Main Loop : Time iteration
          */
-        std::ofstream outfile("residuals.csv");
-        outfile << "time;res_p;res_rho;res_vx;res_vy;res_vz;elapsed_time" << std::endl;
+        std::ofstream outfile;
+        if (rootRank)
+        {
+            outfile.open("residuals.csv");
+            outfile << "time;res_p;res_rho;res_vx;res_vy;res_vz;elapsed_time" << std::endl;
+        }
 
         std::vector<std::ofstream> obs_outfile(config.observers.size());
         data4wave.clear();
         data4wave.resize(config.observers.size());
         for (int obs = 0; obs < config.observers.size(); ++obs)
         {
-            std::string filename = "results/observers" + std::to_string(obs + 1) + ".txt";
-            obs_outfile[obs].open(filename.c_str());
-            obs_outfile[obs] << "time;pressure;density;velocity_x;velocity_y;velocity_z" << std::endl;
+            if (rootRank)
+            {
+                std::string filename = "results/observers" + std::to_string(obs + 1) + ".txt";
+                obs_outfile[obs].open(filename.c_str());
+                obs_outfile[obs] << "time;pressure;density;velocity_x;velocity_y;velocity_z" << std::endl;
+            }
         }
+
+        mesh.haloExchange(u);
 
         auto start = std::chrono::system_clock::now();
         for (double t = config.timeStart, step = 0, tDisplay = 0; t <= config.timeEnd;
@@ -183,11 +216,28 @@ namespace solver
                 /** [2] Print and compute iteration time */
                 auto end = std::chrono::system_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-                gmsh::logger::write("[" + std::to_string(t) + "/" + std::to_string(config.timeEnd) + "s] Step number : " + std::to_string((int)step) + ", Elapsed time: " + std::to_string(elapsed.count()) + "s");
-                screen_display::write_string("time\t\tres_p\t\tres_rho\t\tres_vx\t\tres_vy\t\tres_vz\t\telapsed time", BOLDBLUE);
-                // mesh.writeVTK("result.vtk");
-                std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
-                mesh.writeVTUb(vtu_filename, u);
+                if (rootRank)
+                {
+                    gmsh::logger::write("[" + std::to_string(t) + "/" + std::to_string(config.timeEnd) + "s] Step number : " + std::to_string((int)step) + ", Elapsed time: " + std::to_string(elapsed.count()) + "s");
+                    screen_display::write_string("time\t\tres_p\t\tres_rho\t\tres_vx\t\tres_vy\t\tres_vz\t\telapsed time", BOLDBLUE);
+                }
+
+                if (Parallel::size() > 1)
+                {
+                    std::string vtu_filename = "results/result" + std::to_string((int)step) + "_rank" + std::to_string(Parallel::rank()) + ".vtu";
+                    mesh.writeVTUb(vtu_filename, u);
+                    Parallel::barrier();
+                    if (rootRank)
+                    {
+                        std::string pvtu_filename = "results/result" + std::to_string((int)step) + ".pvtu";
+                        mesh.writePVTUb(pvtu_filename);
+                    }
+                }
+                else if (rootRank)
+                {
+                    std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
+                    mesh.writeVTUb(vtu_filename, u);
+                }
             }
 
             /**
@@ -228,12 +278,13 @@ namespace solver
              */
             mesh.updateFlux(u, Flux, config.v0, config.c0, config.rho0);
             numStep(mesh, config, u, Flux, 1);
+            mesh.haloExchange(u);
 
             /**
              * Compute residuals
              */
 #pragma omp parallel for schedule(static) num_threads(config.numThreads)
-            for (int el = 0; el < mesh.getElNum(); ++el)
+            for (int el = elBegin; el < elEnd; ++el)
             {
                 for (int n = 0; n < mesh.getElNumNodes(); ++n)
                 {
@@ -250,55 +301,79 @@ namespace solver
                     residual[4] += pow(g_v[el][3 * n + 2] - u[3][elN], 2);
                 }
             }
-            outfile << t << ";";
-            std::cout << std::scientific << t << "\t";
+
+            std::vector<double> residualGlobal(residual.size(), 0.0);
+            Parallel::allReduce(residual.data(), residualGlobal.data(), static_cast<int>(residual.size()));
+            residual.swap(residualGlobal);
+
+            // Global #DOFs = sum over ranks of (elEnd - elBegin) * elNumNodes.
+            // We allreduce that count too so root has the correct divisor in
+            // partitioned mode (where mesh.getElNum() is local+halo, not global).
+            int localDof  = (elEnd - elBegin) * mesh.getElNumNodes();
+            int globalDof = Parallel::allReduceScalar<int>(localDof);
+
             auto end_time = std::chrono::system_clock::now();
             auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            for (int eq = 0; eq < residual.size(); ++eq)
+            if (rootRank)
             {
-                residual[eq] /= (mesh.getElNum() * mesh.getElNumNodes());
-                std::cout << std::scientific << residual[eq] << "\t";
-                outfile << residual[eq] << ";";
+                outfile << t << ";";
+                std::cout << std::scientific << t << "\t";
+                for (int eq = 0; eq < residual.size(); ++eq)
+                {
+                    residual[eq] /= globalDof;
+                    std::cout << std::scientific << residual[eq] << "\t";
+                    outfile << residual[eq] << ";";
+                }
+                std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
+                outfile << elapsed_time.count() * 1.0e-6 << std::endl;
             }
-            std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
-            outfile << elapsed_time.count() * 1.0e-6 << std::endl;
 
             /**
              * get observers value
-             * Franke-Little interpolation method
+             * Inverse-distance interpolation. Each rank accumulates local
+             * contributions; the global sum is reduced to root for output.
              */
             for (int obs = 0; obs < config.observers.size(); ++obs)
             {
-                double p(0), rho(0), w_sum(0);
-                std::vector<double> v = {0, 0, 0};
+                double localPVW[5] = {0, 0, 0, 0, 0}; // p, vx, vy, vz, w_sum
                 for (int n = 0; n < obsIndices[obs].size(); ++n)
                 {
-                    double R = config.observers[obs][3];                        //! influence sphere
-                    double w = 1.0 / (pow(obsPtDistance[obs][n], 2) + 1.0e-12); // fmax(1.0-obsPtDistance[obs][n]/R,0.0);//1.0 / pow(obsPtDistance[obs][n],2);
-                    p += u[0][obsIndices[obs][n]] * w;
-                    v[0] += u[1][obsIndices[obs][n]] * w;
-                    v[1] += u[2][obsIndices[obs][n]] * w;
-                    v[2] += u[3][obsIndices[obs][n]] * w;
-                    w_sum += w;
+                    int nodeIdx = obsIndices[obs][n];
+                    int elIdx   = nodeIdx / elNumNodes;
+                    if (elIdx < elBegin || elIdx >= elEnd) continue;
+                    double w = 1.0 / (pow(obsPtDistance[obs][n], 2) + 1.0e-12);
+                    localPVW[0] += u[0][nodeIdx] * w;
+                    localPVW[1] += u[1][nodeIdx] * w;
+                    localPVW[2] += u[2][nodeIdx] * w;
+                    localPVW[3] += u[3][nodeIdx] * w;
+                    localPVW[4] += w;
                 }
-                p /= w_sum;
-                rho = p / pow(config.c0, 2);
-                v[0] /= w_sum;
-                v[1] /= w_sum;
-                v[2] /= w_sum;
-                data4wave[obs].push_back(p);
-                obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << v[0] << ";" << v[1] << ";" << v[2] << std::endl;
+                double globalPVW[5] = {0, 0, 0, 0, 0};
+                Parallel::allReduce(localPVW, globalPVW, 5);
+                if (rootRank && globalPVW[4] > 0.0)
+                {
+                    double p   = globalPVW[0] / globalPVW[4];
+                    double vx  = globalPVW[1] / globalPVW[4];
+                    double vy  = globalPVW[2] / globalPVW[4];
+                    double vz  = globalPVW[3] / globalPVW[4];
+                    double rho = p / pow(config.c0, 2);
+                    data4wave[obs].push_back(p);
+                    obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
+                }
             }
         }
-        for (int obs = 0; obs < config.observers.size(); ++obs)
+        if (rootRank)
         {
-            io::writeWave(data4wave[obs], "results/observer_" + std::to_string(obs + 1) + ".wav", 1.0 / config.timeStep, 16, 1, 1);
-            io::writeFFT(data4wave[obs],config.timeStep,"results/observer_" + std::to_string(obs + 1));
-        }
+            for (int obs = 0; obs < config.observers.size(); ++obs)
+            {
+                io::writeWave(data4wave[obs], "results/observer_" + std::to_string(obs + 1) + ".wav", 1.0 / config.timeStep, 16, 1, 1);
+                io::writeFFT(data4wave[obs],config.timeStep,"results/observer_" + std::to_string(obs + 1));
+            }
 
-        outfile.close();
-        for (int obs = 0; obs < config.observers.size(); ++obs)
-            obs_outfile[obs].close();
+            outfile.close();
+            for (int obs = 0; obs < config.observers.size(); ++obs)
+                obs_outfile[obs].close();
+        }
     }
 
     /**
@@ -310,6 +385,9 @@ namespace solver
      */
     void rungeKutta(std::vector<std::vector<double>> &u, Mesh &mesh, Config config)
     {
+        const bool rootRank = Parallel::isRoot();
+        const int elBegin = localElBegin(mesh);
+        const int elEnd = localElEnd(mesh);
 
         /** Memory allocation */
         elNumNodes = mesh.getElNumNodes();
@@ -332,9 +410,11 @@ namespace solver
         std::vector<std::vector<double>> g_v(mesh.getElNum(), std::vector<double>(3 * elNumNodes));
 
         /** Precomputation (constants over time) */
-        screen_display::write_string("\t>>> Precomputation", BLUE);
+        if (rootRank)
+            screen_display::write_string("\t>>> Precomputation", BLUE);
         mesh.precomputeMassMatrix();
-        screen_display::write_string("\t>>> precomputeMassMatrix", BLUE);
+        if (rootRank)
+            screen_display::write_string("\t>>> precomputeMassMatrix", BLUE);
 
         /** Source */
         std::vector<std::vector<int>> srcIndices;
@@ -396,18 +476,27 @@ namespace solver
          * Main Loop : Time iteration
          */
 
-        std::ofstream outfile("residuals.csv");
-        outfile << "time;res_p;res_rho;res_vx;res_vy;res_vz;elapsed_time" << std::endl;
+        std::ofstream outfile;
+        if (rootRank)
+        {
+            outfile.open("residuals.csv");
+            outfile << "time;res_p;res_rho;res_vx;res_vy;res_vz;elapsed_time" << std::endl;
+        }
 
         std::vector<std::ofstream> obs_outfile(config.observers.size());
         data4wave.clear();
         data4wave.resize(config.observers.size());
         for (int obs = 0; obs < config.observers.size(); ++obs)
         {
-            std::string filename = "results/observers" + std::to_string(obs + 1) + ".txt";
-            obs_outfile[obs].open(filename.c_str());
-            obs_outfile[obs] << "time;density;pressure;velocity_x;velocity_y;velocity_z" << std::endl;
+            if (rootRank)
+            {
+                std::string filename = "results/observers" + std::to_string(obs + 1) + ".txt";
+                obs_outfile[obs].open(filename.c_str());
+                obs_outfile[obs] << "time;density;pressure;velocity_x;velocity_y;velocity_z" << std::endl;
+            }
         }
+
+        mesh.haloExchange(u);
 
         auto start = std::chrono::system_clock::now();
         for (double t = config.timeStart, step = 0, tDisplay = 0; t <= config.timeEnd;
@@ -444,12 +533,28 @@ namespace solver
                 /** [2] Print and compute iteration time */
                 auto end = std::chrono::system_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(end - start);
-                gmsh::logger::write("[" + std::to_string(t) + "/" + std::to_string(config.timeEnd) + "s] Step number : " + std::to_string((int)step) + ", Elapsed time: " + std::to_string(elapsed.count()) + "s");
-                screen_display::write_string("time\t\tres_p\t\tres_rho\t\tres_vx\t\tres_vy\t\tres_vz\t\telapsed time", BOLDBLUE);
-                // mesh.writeVTK("result.vtk");
-                std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
-                mesh.writeVTUb(vtu_filename, u);
-                // mesh.writeVTK("result.vtk",u);
+                if (rootRank)
+                {
+                    gmsh::logger::write("[" + std::to_string(t) + "/" + std::to_string(config.timeEnd) + "s] Step number : " + std::to_string((int)step) + ", Elapsed time: " + std::to_string(elapsed.count()) + "s");
+                    screen_display::write_string("time\t\tres_p\t\tres_rho\t\tres_vx\t\tres_vy\t\tres_vz\t\telapsed time", BOLDBLUE);
+                }
+
+                if (Parallel::size() > 1)
+                {
+                    std::string vtu_filename = "results/result" + std::to_string((int)step) + "_rank" + std::to_string(Parallel::rank()) + ".vtu";
+                    mesh.writeVTUb(vtu_filename, u);
+                    Parallel::barrier();
+                    if (rootRank)
+                    {
+                        std::string pvtu_filename = "results/result" + std::to_string((int)step) + ".pvtu";
+                        mesh.writePVTUb(pvtu_filename);
+                    }
+                }
+                else if (rootRank)
+                {
+                    std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
+                    mesh.writeVTUb(vtu_filename, u);
+                }
             }
 
             /** Source */
@@ -489,21 +594,25 @@ namespace solver
             /** [1] Step R-K */
             mesh.updateFlux(k1, Flux, config.v0, config.c0, config.rho0);
             numStep(mesh, config, k1, Flux, 0);
+            mesh.haloExchange(k1);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k2[eq].data(), k1[eq].data(), 0.5, numNodes);
             /** [2] Step R-K */
             mesh.updateFlux(k2, Flux, config.v0, config.c0, config.rho0);
             numStep(mesh, config, k2, Flux, 0);
+            mesh.haloExchange(k2);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k3[eq].data(), k2[eq].data(), 0.5, numNodes);
             /** [3] Step R-K */
             mesh.updateFlux(k3, Flux, config.v0, config.c0, config.rho0);
             numStep(mesh, config, k3, Flux, 0);
+            mesh.haloExchange(k3);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k4[eq].data(), k3[eq].data(), 1, numNodes);
             /** [4] Step R-K */
             mesh.updateFlux(k4, Flux, config.v0, config.c0, config.rho0);
             numStep(mesh, config, k4, Flux, 0);
+            mesh.haloExchange(k4);
             /** Concat results of R-K iterations */
             // #pragma omp parallel for
             for (int eq = 0; eq < u.size(); ++eq)
@@ -515,8 +624,10 @@ namespace solver
                 }
             }
 
+            mesh.haloExchange(u);
+
 #pragma omp parallel for schedule(static) num_threads(config.numThreads)
-            for (int el = 0; el < mesh.getElNum(); ++el)
+            for (int el = elBegin; el < elEnd; ++el)
             {
                 for (int n = 0; n < mesh.getElNumNodes(); ++n)
                 {
@@ -533,53 +644,74 @@ namespace solver
                     residual[4] += pow(g_v[el][3 * n + 2] - u[3][elN], 2);
                 }
             }
-            outfile << t << ";";
-            std::cout << std::scientific << t << "\t";
+
+            std::vector<double> residualGlobal(residual.size(), 0.0);
+            Parallel::allReduce(residual.data(), residualGlobal.data(), static_cast<int>(residual.size()));
+            residual.swap(residualGlobal);
+
+            int localDof  = (elEnd - elBegin) * mesh.getElNumNodes();
+            int globalDof = Parallel::allReduceScalar<int>(localDof);
+
             auto end_time = std::chrono::system_clock::now();
             auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            for (int eq = 0; eq < residual.size(); ++eq)
+            if (rootRank)
             {
-                residual[eq] /= (mesh.getElNum() * mesh.getElNumNodes());
-                std::cout << std::scientific << residual[eq] << "\t";
-                outfile << residual[eq] << ";";
+                outfile << t << ";";
+                std::cout << std::scientific << t << "\t";
+                for (int eq = 0; eq < residual.size(); ++eq)
+                {
+                    residual[eq] /= globalDof;
+                    std::cout << std::scientific << residual[eq] << "\t";
+                    outfile << residual[eq] << ";";
+                }
+                std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
+                outfile << elapsed_time.count() * 1.0e-6 << std::endl;
             }
-            std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
-            outfile << elapsed_time.count() * 1.0e-6 << std::endl;
             /**
              * get observers value
-             * Inverse distance weight interpolation method
+             * Inverse-distance interpolation. Each rank accumulates local
+             * contributions; the global sum is reduced to root for output.
              */
             for (int obs = 0; obs < config.observers.size(); ++obs)
             {
-                double p(0), rho(0), w_sum(0);
-                std::vector<double> v = {0, 0, 0};
+                double localPVW[5] = {0, 0, 0, 0, 0}; // p, vx, vy, vz, w_sum
                 for (int n = 0; n < obsIndices[obs].size(); ++n)
                 {
-                    double R = config.observers[obs][3];                        //! influence sphere
-                    double w = 1.0 / (pow(obsPtDistance[obs][n], 2) + 1.0e-12); // fmax(1.0-obsPtDistance[obs][n]/R,0.0);//1.0 / pow(obsPtDistance[obs][n],2);
-                    p += u[0][obsIndices[obs][n]] * w;
-                    v[0] += u[1][obsIndices[obs][n]] * w;
-                    v[1] += u[2][obsIndices[obs][n]] * w;
-                    v[2] += u[3][obsIndices[obs][n]] * w;
-                    w_sum += w;
+                    int nodeIdx = obsIndices[obs][n];
+                    int elIdx   = nodeIdx / elNumNodes;
+                    if (elIdx < elBegin || elIdx >= elEnd) continue;
+                    double w = 1.0 / (pow(obsPtDistance[obs][n], 2) + 1.0e-12);
+                    localPVW[0] += u[0][nodeIdx] * w;
+                    localPVW[1] += u[1][nodeIdx] * w;
+                    localPVW[2] += u[2][nodeIdx] * w;
+                    localPVW[3] += u[3][nodeIdx] * w;
+                    localPVW[4] += w;
                 }
-                p /= w_sum;
-                rho = p / pow(config.c0, 2);
-                v[0] /= w_sum;
-                v[1] /= w_sum;
-                v[2] /= w_sum;
-                data4wave[obs].push_back(p);
-                obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << v[0] << ";" << v[1] << ";" << v[2] << std::endl;
+                double globalPVW[5] = {0, 0, 0, 0, 0};
+                Parallel::allReduce(localPVW, globalPVW, 5);
+                if (rootRank && globalPVW[4] > 0.0)
+                {
+                    double p   = globalPVW[0] / globalPVW[4];
+                    double vx  = globalPVW[1] / globalPVW[4];
+                    double vy  = globalPVW[2] / globalPVW[4];
+                    double vz  = globalPVW[3] / globalPVW[4];
+                    double rho = p / pow(config.c0, 2);
+                    data4wave[obs].push_back(p);
+                    obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
+                }
             }
         }
-        for (int obs = 0; obs < config.observers.size(); ++obs)
+        if (rootRank)
         {
-            io::writeWave(data4wave[obs], "results/observer_" + std::to_string(obs + 1) + ".wav", 1.0 / config.timeStep, 16, 1, 1);
-            io::writeFFT(data4wave[obs],config.timeStep,"results/observer_" + std::to_string(obs + 1));
-        }
+            for (int obs = 0; obs < config.observers.size(); ++obs)
+            {
+                io::writeWave(data4wave[obs], "results/observer_" + std::to_string(obs + 1) + ".wav", 1.0 / config.timeStep, 16, 1, 1);
+                io::writeFFT(data4wave[obs],config.timeStep,"results/observer_" + std::to_string(obs + 1));
+            }
 
-        outfile.close();
-        for (int obs = 0; obs < config.observers.size(); ++obs)
-            obs_outfile[obs].close();
+            outfile.close();
+            for (int obs = 0; obs < config.observers.size(); ++obs)
+                obs_outfile[obs].close();
+        }
     }
 }
