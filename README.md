@@ -13,9 +13,16 @@ The solver is based on [GMSH](http://gmsh.info/) library and supports a wide ran
 - Absorbing and reflecting boundaries
 - Support 'json' format configartion file
 - Multiple sources support: monopoles, dipoles, quadrupoles, user defined analytical formulation sources and external data (csv and sound 'wave' file supported) 
-- Complex geometry and unstructured grid (only triangles (2D) and tetrahedrons (3D) elements are supported)
-- VTK post-processing (use [Paraview](https://www.paraview.org/)) 
+- Complex geometry and unstructured grid
+- Optional MPI parallelization for distributed runs
+- VTK post-processing, including `.pvtu`/`.pvd` outputs in MPI mode (use [Paraview](https://www.paraview.org/)) 
 - User defined obervers position post-processing (text data time variables, Fast Fourier Transform, Pressure Power Spectral Density and sound 'wave' files)
+
+Mesh support status:
+
+- 2D: triangles and quadrilaterals are supported
+- 3D: tetrahedra are supported and validated
+- 3D hexahedra: work is in progress and not yet fully validated for production use
 
 <!-- | Auditorium     | Isosurfaces     | Bulk|
 | ------------- |:-------------:| :-------------:| 
@@ -36,6 +43,7 @@ First, make sure the following libraries are installed. If you are running a lin
 - ~~Libtbb~~
 - VTK (v9.x)
 - FFTW
+- MPI implementation when building with `-DDG_USE_MPI=ON` (`mpich` on macOS via `build.sh`, `openmpi` on Linux via `build.sh`)
 
 
 ### Installing
@@ -44,6 +52,15 @@ git clone https://github.com/skhelladi/DGFEM-CAA.git
 cd DGFEM-CAA
 sh build.sh
 ```
+
+To enable MPI with the setup script:
+
+```
+git clone https://github.com/skhelladi/DGFEM-CAA.git
+cd DGFEM-CAA
+DG_USE_MPI=ON sh build.sh
+```
+
 or use
 ```
 git clone https://github.com/skhelladi/DGFEM-CAA.git
@@ -53,8 +70,18 @@ cmake ../ -DCMAKE_BUILD_TYPE=Release  -G "Unix Makefiles" -DGMSH_INCLUDE_DIRS=".
 make -j4
 ```
 
+Minimal CMake configuration with MPI enabled:
+
+```
+git clone https://github.com/skhelladi/DGFEM-CAA.git
+cd DGFEM-CAA
+mkdir build-mpi && cd build-mpi
+cmake .. -DCMAKE_BUILD_TYPE=Release -DDG_USE_MPI=ON
+make -j4
+```
+
 ## Running the tests
-Once the sources sucessfully build, you can start using with the solver. It required two arguments: a mesh file created with Gmsh and a config file containing the solver options. Examples of mesh files and config files are given [here](https://github.com/skhelladi/DGFEM-CAA/tree/development/doc).
+Once the sources sucessfully build, you can start using the solver. It requires a configuration file that references the mesh file and the solver options. Example configurations are provided in [tests](tests) and [doc/config](doc/config).
 
 ```
 cd bin
@@ -73,14 +100,30 @@ cd bin
 
 ```
 cd build/bin
-./dgalerkin ../../doc/config/Square.conf 
+./dgalerkin ../../tests/square.json
 ```
-or 
+
+3D propagation on the tetrahedral cube regression case.
 
 ```
 cd build/bin
-./dgalerkin ../../doc/config/Square.json 
+./dgalerkin ../../tests/cube.json
 ```
+
+MPI example on the same 2D regression case:
+
+```
+cd build-mpi/bin
+mpirun -n 2 ./dgalerkin ../../tests/square.json
+```
+
+MPI writes one `.vtu` file per rank together with a `.pvtu` aggregator and a `results.pvd` time-series file.
+
+Current regression cases in [tests](tests):
+
+- [tests/square.json](tests/square.json): 2D quadrilateral mesh
+- [tests/cube.json](tests/cube.json): 3D tetrahedral cube mesh
+- [tests/cube_unstr.json](tests/cube_unstr.json): additional 3D cube case
 
 or configure run_caa batch file with the right mesh and configurations files.
 
