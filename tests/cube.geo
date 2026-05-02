@@ -7,7 +7,7 @@
 SetFactory("OpenCASCADE");
 
 L = 100.0;   // domain side [m]
-N = 25;       // number of divisions per edge
+N = 50;       // number of divisions per edge
 
 Box(1) = {0, 0, 0, L, L, L};
 

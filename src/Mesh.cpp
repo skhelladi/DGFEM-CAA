@@ -50,6 +50,20 @@ static void loadFaceNodesByPartition(const PartitionLayout &layout,
  */
 Mesh::Mesh(Config config) : config(config)
 {
+    // ----------------------------------------------------------------
+    // Phase 7 profiler — cumulative timing of major preprocessing blocks.
+    // Set DG_PROFILE_MESH=1 to enable; output is one CSV line per rank
+    // on stdout at end of constructor (ingestible by pandas/awk).
+    // ----------------------------------------------------------------
+    using prof_clk = std::chrono::steady_clock;
+    const bool profileMesh = (std::getenv("DG_PROFILE_MESH") != nullptr);
+    auto profTotalStart = prof_clk::now();
+    std::map<std::string, long long> profUs;
+    auto profMark = [&](const std::string &label, prof_clk::time_point t0) {
+        if (!profileMesh) return;
+        auto t1 = prof_clk::now();
+        profUs[label] += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    };
 
     /******************************
      *          Elements          *
@@ -68,6 +82,7 @@ Mesh::Mesh(Config config) : config(config)
     };
 
     auto start = std::chrono::system_clock::now();
+    auto pt = prof_clk::now();
     m_elDim = gmsh::model::getDimension();
     gmsh::model::mesh::getElementTypes(m_elType, m_elDim);
     int _numPrimaryNodes = 0;
@@ -79,15 +94,18 @@ Mesh::Mesh(Config config) : config(config)
 
     // Integration points (mesh-independent; depends only on element type)
     gmsh::model::mesh::getIntegrationPoints(m_elType[0], m_elIntType, m_elParamCoord, m_elWeight);
+    profMark("01_el_props_intpts", pt);
 
     screen_display::write_string("Elements - Compute Jacobian", GREEN);
 
+    pt = prof_clk::now();
     int _numOrientations;
     int _numComponents;
     gmsh::model::mesh::getBasisFunctions(m_elType[0], m_elParamCoord, config.elementType,
                                          _numComponents, m_elBasisFcts, _numOrientations);
     gmsh::model::mesh::getBasisFunctions(m_elType[0], m_elParamCoord, "Grad" + config.elementType,
                                          _numComponents, m_elUGradBasisFcts, _numOrientations);
+    profMark("02_el_basis_fcts", pt);
 
 #ifdef DG_USE_MPI
     bool usePartition = (Parallel::size() > 1);
@@ -95,12 +113,16 @@ Mesh::Mesh(Config config) : config(config)
     int nLocal = 0, nHalo = 0;
     if (usePartition)
     {
+        pt = prof_clk::now();
         // Partitioned load: each rank only allocates [owned | halo].
         PartitionLayout layout = buildPartitionLayout();
+        profMark("03a_buildPartitionLayout", pt);
+        pt = prof_clk::now();
         loadElementsByPartition(layout, m_elType[0], m_elParamCoord,
                                 m_elTags, m_elNodeTags,
                                 m_elJacobians, m_elJacobianDets, m_elIntPtCoords,
                                 haloOwnerRank, nLocal, nHalo);
+        profMark("03b_loadElementsByPartition", pt);
         m_elNum = nLocal + nHalo;
 
         // Member partition state (replaces the old global m_elOwnerRank/range)
@@ -118,11 +140,15 @@ Mesh::Mesh(Config config) : config(config)
     else
 #endif
     {
+        pt = prof_clk::now();
         // Non-MPI / single-rank path: full global mesh on this process.
         gmsh::model::mesh::getElementsByType(m_elType[0], m_elTags, m_elNodeTags);
         m_elNum = (int)m_elTags.size();
+        profMark("03c_getElementsByType_seq", pt);
+        pt = prof_clk::now();
         gmsh::model::mesh::getJacobians(m_elType[0], m_elParamCoord, m_elJacobians,
                                         m_elJacobianDets, m_elIntPtCoords);
+        profMark("03d_getJacobians_seq", pt);
     }
 
     // std::ofstream _outfile_("m_elJacobians.txt");
@@ -156,6 +182,7 @@ Mesh::Mesh(Config config) : config(config)
      */
 
     start = std::chrono::system_clock::now();
+    pt = prof_clk::now();
     std::vector<double> jacobian(m_elDim * m_elDim);
     m_elGradBasisFcts.resize(m_elNum * m_elNumNodes * m_elNumIntPts * 3);
 
@@ -186,6 +213,8 @@ Mesh::Mesh(Config config) : config(config)
             }
         }
     }
+
+    profMark("04_el_phys_grad_basis", pt);
 
     // pp("Element jacobian", jacobian, 1);
 
@@ -228,6 +257,7 @@ Mesh::Mesh(Config config) : config(config)
     /**
      * [1] Get Faces for all elements (local + halo in MPI mode)
      */
+    pt = prof_clk::now();
 #ifdef DG_USE_MPI
     if (Parallel::size() > 1)
     {
@@ -245,6 +275,7 @@ Mesh::Mesh(Config config) : config(config)
         else
             gmsh::model::mesh::getElementFaceNodes(m_elType[0], hasQuadrilateralFaces ? 4 : 3, m_elFNodeTags, -1);
     }
+    profMark("05_get_face_nodes", pt);
 
     m_fNumPerEl = m_elFNodeTags.size() / (m_elNum * m_fNumNodes);
     end = std::chrono::system_clock::now();
@@ -257,9 +288,11 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Remove the faces counted two times", GREEN);
     start = std::chrono::system_clock::now();
 
+    pt = prof_clk::now();
     //! ////////////////////////////////
     getUniqueFaceNodeTags();
     //! ////////////////////////////////
+    profMark("06_uniqueFaceNodeTags", pt);
 
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -272,6 +305,7 @@ Mesh::Mesh(Config config) : config(config)
      */
     screen_display::write_string("Create a single entity");
     start = std::chrono::system_clock::now();
+    pt = prof_clk::now();
     m_fEntity = gmsh::model::addDiscreteEntity(m_fDim);
 
     gmsh::model::mesh::addElementsByType(m_fEntity, m_fType, {}, m_fNodeTags);
@@ -281,6 +315,7 @@ Mesh::Mesh(Config config) : config(config)
     gmsh::model::mesh::getIntegrationPoints(m_fType, m_fIntType, m_fIntParamCoords, m_fWeight);
 
     m_fNum = m_fNodeTags.size() / m_fNumNodes;
+    profMark("07_face_entity_creation", pt);
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
@@ -291,6 +326,7 @@ Mesh::Mesh(Config config) : config(config)
      */
     screen_display::write_string("Faces - Compute Jacobian");
     start = std::chrono::system_clock::now();
+    pt = prof_clk::now();
     m_fIntType = m_elIntType;
 
     gmsh::model::mesh::getBasisFunctions(m_fType, m_fIntParamCoords, config.elementType, *new int, m_fBasisFcts, _numOrientations);
@@ -300,10 +336,12 @@ Mesh::Mesh(Config config) : config(config)
     gmsh::model::mesh::getJacobians(m_fType, m_fIntParamCoords, m_fJacobians, m_fJacobianDets, m_fIntPtCoords, m_fEntity);
 
     m_fNumIntPts = (int)m_fJacobianDets.size() / m_fNum;
+    profMark("08_face_basis_jacobians", pt);
 
     /**
      * See element part for explanation. (line 40)
      */
+    pt = prof_clk::now();
     m_fGradBasisFcts.resize(m_fNum * m_fNumNodes * m_fNumIntPts * 3);
     // #pragma omp parallel for
     for (int f = 0; f < m_fNum; ++f)
@@ -324,6 +362,7 @@ Mesh::Mesh(Config config) : config(config)
             }
         }
     }
+    profMark("09_face_phys_grad_basis", pt);
 
     // pp("m_fJacobians", m_fJacobians, 3);
 
@@ -336,6 +375,7 @@ Mesh::Mesh(Config config) : config(config)
 
     screen_display::write_string("Define a normal/tangent/bitangent (1D and 2D only, 3D in progress) associated to each surface.", GREEN);
     start = std::chrono::system_clock::now();
+    pt = prof_clk::now();
     std::vector<double> normal(m_Dim);
     std::vector<double> tangent(m_Dim);
     std::vector<double> bitangent(m_Dim);
@@ -435,6 +475,8 @@ Mesh::Mesh(Config config) : config(config)
     if (m_elDim == 3 && m_elOrder != 1)
         fc = -1;
 
+    profMark("10_face_normals_tangents", pt);
+
     screen_display::write_if_false(m_elFNodeTags.size() == m_elNum * m_fNumPerEl * m_fNumNodes, "m_elFNodeTags size error");
     screen_display::write_if_false(m_fJacobianDets.size() == m_fNum * m_fNumIntPts, "m_fJacobianDets size error");
     screen_display::write_if_false(m_fBasisFcts.size() == m_fNumNodes * m_fNumIntPts, "m_fBasisFcts size error");
@@ -466,9 +508,11 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Connectivity: Assign corresponding faces to each element", GREEN);
     start = std::chrono::system_clock::now();
 
+    pt = prof_clk::now();
     //! ////////////////////////////////
     getConnectivityFaceToElement();
     //! ////////////////////////////////
+    profMark("11_getConnectivityFaceToElement", pt);
 
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -482,6 +526,7 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Store the mapping between face node id and element node id", GREEN);
     start = std::chrono::system_clock::now();
 
+    pt = prof_clk::now();
     m_fNToElNIds.resize(m_fNum);
     // #pragma omp parallel for
     for (int f = 0; f < m_fNum; ++f)
@@ -498,6 +543,7 @@ Mesh::Mesh(Config config) : config(config)
             }
         }
     }
+    profMark("12_face_to_el_node_map", pt);
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
@@ -518,6 +564,7 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Define normals orientation", GREEN);
     start = std::chrono::system_clock::now();
 
+    pt = prof_clk::now();
     double dotProduct;
     std::vector<double> m_elBarycenters, fNodeCoord(3), elOuterDir(3), paramCoords;
 #ifdef DG_USE_MPI
@@ -555,6 +602,7 @@ Mesh::Mesh(Config config) : config(config)
         }
     }
 
+    profMark("13_el_face_orientation", pt);
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
@@ -567,6 +615,7 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Reclassification of the neighbouring elements", GREEN);
     start = std::chrono::system_clock::now();
 
+    pt = prof_clk::now();
     size_t elf;
     // #pragma omp parallel for
     for (int f = 0; f < m_fNum; ++f)
@@ -590,6 +639,7 @@ Mesh::Mesh(Config config) : config(config)
     assert(m_elFIds.size() == m_elNum * m_fNumPerEl);
     assert(m_elFOrientation.size() == m_elNum * m_fNumPerEl);
 
+    profMark("14_nbr_reclassification", pt);
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
@@ -597,6 +647,7 @@ Mesh::Mesh(Config config) : config(config)
     gmsh::logger::write("==================================================");
     gmsh::logger::write("Element-Face connectivity retrieved.");
     start = std::chrono::system_clock::now();
+    pt = prof_clk::now();
     //---------------------------------------------------------------------
     // Boundary conditions
     //---------------------------------------------------------------------
@@ -682,6 +733,7 @@ Mesh::Mesh(Config config) : config(config)
             }
         }
     }
+    profMark("15_boundary_conditions", pt);
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
@@ -695,6 +747,7 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_string("Compute the R*K*R matrix product", GREEN);
     start = std::chrono::system_clock::now();
 
+    pt = prof_clk::now();
     RKR.resize(m_fNum * m_fNumIntPts);
 
     // #pragma omp parallel for
@@ -744,14 +797,18 @@ Mesh::Mesh(Config config) : config(config)
         }
     }
 
+    profMark("16_RKR_matrix", pt);
+
     assert(m_fIsBoundary.size() == m_fNum);
 
 #ifdef DG_USE_MPI
     if (Parallel::size() > 1)
     {
+        pt = prof_clk::now();
         classifyFaces();
         buildHalo();
         buildLocalFaceList();
+        profMark("17_mpi_halo_setup", pt);
     }
 #endif
 
@@ -759,18 +816,49 @@ Mesh::Mesh(Config config) : config(config)
      * Extra Memory allocation:
      * Instantiate Ghost Elements and numerical flux storage.
      */
+    pt = prof_clk::now();
     m_fFlux.resize(m_fNum * m_fNumNodes);
     uGhost = std::vector<std::vector<double>>(4,
                                               std::vector<double>(m_fNum * m_fNumIntPts));
     FluxGhost = std::vector<std::vector<std::vector<double>>>(4,
                                                               std::vector<std::vector<double>>(m_fNum * m_fNumIntPts,
                                                                                                std::vector<double>(3)));
+    profMark("18_ghost_alloc", pt);
 
     gmsh::logger::write("Boundary conditions successfuly loaded.");
     gmsh::logger::write("==================================================");
     end = std::chrono::system_clock::now();
     elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
+
+    // ----- Phase 7 profiler output -----
+    if (profileMesh)
+    {
+        long long totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                prof_clk::now() - profTotalStart).count();
+        const int rank = Parallel::rank();
+        // CSV header (rank 0 only) for easy ingestion
+        if (rank == 0)
+        {
+            std::cerr << "PROF_CSV,rank,section,seconds,share_percent" << std::endl;
+        }
+        // Sum
+        long long sumUs = 0;
+        for (auto &kv : profUs) sumUs += kv.second;
+        for (auto &kv : profUs)
+        {
+            const double s     = kv.second / 1e6;
+            const double share = sumUs > 0 ? 100.0 * kv.second / sumUs : 0.0;
+            std::cerr << "PROF_CSV," << rank << "," << kv.first
+                      << "," << s << "," << share << std::endl;
+        }
+        std::cerr << "PROF_CSV," << rank << ",TOTAL," << totalUs / 1e6
+                  << ",100" << std::endl;
+        std::cerr << "PROF_CSV," << rank << ",num_elements,"
+                  << m_elNum << ",-1" << std::endl;
+        std::cerr << "PROF_CSV," << rank << ",num_faces,"
+                  << m_fNum << ",-1" << std::endl;
+    }
 }
 
 #ifdef DG_USE_MPI
@@ -1617,111 +1705,83 @@ void Mesh::updateFlux(std::vector<std::vector<double>> &u, std::vector<std::vect
 
 void Mesh::getUniqueFaceNodeTags()
 {
+    // Phase 9.2 refactor: hashmap-based deduplication of face node tags.
+    //
+    // Old algorithm: for each face in m_elFNodeTags, scan a "global face list"
+    // (from gmsh::createFaces / getAllFaces) by linear search → O(Nf²)
+    // dominated everything (94% of preprocessing on 16k tets).
+    //
+    // New algorithm: build a sorted "native-node" key per face and insert
+    // into an unordered_map. First-occurrence wins; subsequent occurrences
+    // are duplicates and dropped. → O(Nf) average.
+
     const bool hasQuadrilateralFaces = (m_fDim == 2 && m_fName == "quadrangle");
-    auto hasSameNativeNodes = [](const std::vector<size_t> &lhs, const std::vector<size_t> &rhs, size_t nativeCount)
-    {
-        std::vector<size_t> lhsNative(lhs.begin(), lhs.begin() + nativeCount);
-        std::vector<size_t> rhsNative(rhs.begin(), rhs.begin() + nativeCount);
-        std::sort(lhsNative.begin(), lhsNative.end());
-        std::sort(rhsNative.begin(), rhsNative.end());
-        return std::equal(lhsNative.begin(), lhsNative.end(), rhsNative.begin());
+    const size_t fNumNativeNodes = (m_fDim < 2) ? 2 : (hasQuadrilateralFaces ? 4 : 3);
+    const size_t totalFaces = m_elFNodeTags.size() / m_fNumNodes;
+
+    auto start = std::chrono::system_clock::now();
+
+    // 1) Pre-sort each face's full node list (kept for downstream consumers).
+    m_elFNodeTagsOrdered = m_elFNodeTags;
+    for (size_t i = 0; i + m_fNumNodes <= m_elFNodeTagsOrdered.size(); i += m_fNumNodes)
+        std::sort(m_elFNodeTagsOrdered.begin() + i,
+                  m_elFNodeTagsOrdered.begin() + (i + m_fNumNodes));
+
+    // 2) Build canonical key per face from its sorted native-node tuple.
+    //    For typical sizes (2/3/4 native nodes), keep keys in a small fixed
+    //    array and use a custom hash combiner — much faster than std::string.
+    auto canonicalKey = [&](size_t faceIdx, std::array<size_t, 4> &out) {
+        for (size_t k = 0; k < fNumNativeNodes; ++k)
+            out[k] = m_elFNodeTagsOrdered[faceIdx * m_fNumNodes + k];
+        for (size_t k = fNumNativeNodes; k < 4; ++k)
+            out[k] = 0;
     };
 
-    // Ordering per face for efficient comparison
-    m_elFNodeTagsOrdered = m_elFNodeTags;
-    // #pragma omp parallel for
-    for (int i = 0; i < m_elFNodeTagsOrdered.size(); i += m_fNumNodes)
-        std::sort(/*std::execution::par,*/ m_elFNodeTagsOrdered.begin() + i, m_elFNodeTagsOrdered.begin() + (i + m_fNumNodes));
-
-    screen_display::write_string("get Unique Face Node Tags", RED);
-
-    m_fNodeTags = m_elFNodeTags;
-    std::vector<size_t> m_fNodeTags_t;
-    std::vector<size_t> m_fNodeTags_tmp;
-    std::vector<std::vector<size_t>> m_fNodeTags_tab;
-    size_t fNumNativeNodes;
-
-    //! TIMER start ////////////////////////////////
-    auto start = std::chrono::system_clock::now();
-    //! ////////////////////////////////////////////
-    if (m_fDim < 2)
-    {
-        screen_display::write_string("Create and get all egdes", BLUE);
-        std::vector<size_t> edge_tags;
-        gmsh::model::mesh::createEdges();
-        gmsh::model::mesh::getAllEdges(edge_tags, m_fNodeTags_t);
-        fNumNativeNodes = 2;
-
-        std::vector<std::vector<size_t>> m_fNodeTags_tab_full = vector_to_matrix(m_fNodeTags, m_fNumNodes);
-        std::vector<std::vector<size_t>> m_fNodeTags_t_tab = vector_to_matrix(m_fNodeTags_t, fNumNativeNodes);
-
-        for (size_t i = 0; i < m_fNodeTags_tab_full.size(); i++)
-        {
-            for (size_t j = 0; j < m_fNodeTags_t_tab.size(); j++)
-            {
-                if (isNCoincidentValues2d(m_fNodeTags_tab_full[i], m_fNodeTags_t_tab[j]))
-                {
-                    m_fNodeTags_tab.push_back(m_fNodeTags_tab_full[i]);
-                    erase_row_from_matrix(m_fNodeTags_t_tab, j);
-                    break;
-                }
+    struct KeyHash {
+        size_t operator()(const std::array<size_t, 4> &k) const noexcept {
+            // splitmix-style mix; cheap and well-distributed for moderate Nf
+            size_t h = 1469598103934665603ull;
+            for (auto v : k) {
+                h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
             }
+            return h;
         }
-    }
-    else
+    };
+
+    std::unordered_map<std::array<size_t, 4>, size_t, KeyHash> firstOccurrence;
+    firstOccurrence.reserve(totalFaces);
+    std::vector<size_t> uniqueFaceIndices;
+    uniqueFaceIndices.reserve(totalFaces);
+
+    std::array<size_t, 4> key{0, 0, 0, 0};
+    for (size_t i = 0; i < totalFaces; ++i)
     {
-        screen_display::write_string("Create and get all faces", BLUE);
-        std::vector<size_t> face_tags;
-        gmsh::model::mesh::createFaces();
-        gmsh::model::mesh::getAllFaces(hasQuadrilateralFaces ? 4 : 3, face_tags, m_fNodeTags_t);
-        fNumNativeNodes = hasQuadrilateralFaces ? 4 : 3;
-
-        std::vector<std::vector<size_t>> m_fNodeTags_tab_full = vector_to_matrix(m_fNodeTags, m_fNumNodes);
-        std::vector<std::vector<size_t>> m_fNodeTags_t_tab = vector_to_matrix(m_fNodeTags_t, fNumNativeNodes);
-
-        for (size_t i = 0; i < m_fNodeTags_tab_full.size(); i++)
-        {
-            for (size_t j = 0; j < m_fNodeTags_t_tab.size(); j++)
-            {
-                if (hasSameNativeNodes(m_fNodeTags_tab_full[i], m_fNodeTags_t_tab[j], fNumNativeNodes))
-                {
-                    m_fNodeTags_tab.push_back(m_fNodeTags_tab_full[i]);
-                    erase_row_from_matrix(m_fNodeTags_t_tab, j);
-                    break;
-                }
-            }
-        }
-
-        // auto inner_loop = [&](std::vector<size_t> &V)
-        // {
-        //     for (size_t j = 0; j < m_fNodeTags_t_tab.size(); j++)
-        //     {
-        //         if (isNCoincidentValues3d(V, m_fNodeTags_t_tab[j])) // fNumNativeNodes
-        //         {
-        //             m_fNodeTags_tab.push_back(V);
-        //             erase_row_from_matrix(m_fNodeTags_t_tab, j);
-        //             break;
-        //         }
-        //     }
-        // };
-        // for_each(m_fNodeTags_tab_full.begin(), m_fNodeTags_tab_full.end(), inner_loop);
+        canonicalKey(i, key);
+        auto [it, inserted] = firstOccurrence.try_emplace(key, i);
+        if (inserted) uniqueFaceIndices.push_back(i);
     }
 
-    size_t tmp;
-    // m_fNodeTags.clear();
-    m_fNodeTags = matrix_to_vector(m_fNodeTags_tab, tmp);
-    // m_fNodeTagsOrdered.clear();
+    // 3) Materialize m_fNodeTags by copying the first-occurrence face's full
+    //    node list — preserves the original node ordering used downstream
+    //    (orientation, Jacobians, addElementsByType).
+    m_fNodeTags.clear();
+    m_fNodeTags.reserve(uniqueFaceIndices.size() * m_fNumNodes);
+    for (size_t idx : uniqueFaceIndices)
+    {
+        m_fNodeTags.insert(m_fNodeTags.end(),
+                           m_elFNodeTags.begin() + idx * m_fNumNodes,
+                           m_elFNodeTags.begin() + (idx + 1) * m_fNumNodes);
+    }
+
+    // 4) Sorted version, used by the connectivity step.
     m_fNodeTagsOrdered = m_fNodeTags;
-    for (int i = 0; i < m_fNodeTagsOrdered.size(); i += m_fNumNodes)
-        std::sort(/*std::execution::par,*/ m_fNodeTagsOrdered.begin() + i, m_fNodeTagsOrdered.begin() + (i + m_fNumNodes));
+    for (size_t i = 0; i + m_fNumNodes <= m_fNodeTagsOrdered.size(); i += m_fNumNodes)
+        std::sort(m_fNodeTagsOrdered.begin() + i,
+                  m_fNodeTagsOrdered.begin() + (i + m_fNumNodes));
 
-    screen_display::write_if_false(tmp == m_fNumNodes, "Bad dimension error...");
-
-    //! TIMER END ///////////////////////////////////////////////////////////////////
     auto end = std::chrono::system_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time (getUniqueFaceNodeTags):", elapsed.count() * 1.0e-6, "s", BLUE);
-    //! //////////////////////////////////////////////////////////////////////////////
 }
 
 std::vector<size_t> vector_of_tags(size_t vec_size, size_t offset)

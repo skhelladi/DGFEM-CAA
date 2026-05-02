@@ -498,6 +498,13 @@ namespace solver
 
         mesh.haloExchange(u);
 
+        // Cumulative profiling counters (microseconds), printed at the end.
+        long long t_halo_us = 0;
+        long long t_updFlux_us = 0;
+        long long t_numStep_us = 0;
+        long long t_residual_us = 0;
+        long long t_obs_io_us = 0;
+
         auto start = std::chrono::system_clock::now();
         for (double t = config.timeStart, step = 0, tDisplay = 0; t <= config.timeEnd;
              t += config.timeStep, tDisplay += config.timeStep, ++step)
@@ -590,29 +597,51 @@ namespace solver
             /**
              * Fourth order Runge-Kutta algorithm
              */
+            using clk = std::chrono::system_clock;
+            auto tic = [](){ return clk::now(); };
+            auto us  = [](clk::time_point t0){
+                return std::chrono::duration_cast<std::chrono::microseconds>(clk::now() - t0).count();
+            };
+
             k1 = k2 = k3 = k4 = u;
+            auto tt = tic();
             /** [1] Step R-K */
             mesh.updateFlux(k1, Flux, config.v0, config.c0, config.rho0);
+            t_updFlux_us += us(tt); tt = tic();
             numStep(mesh, config, k1, Flux, 0);
+            t_numStep_us += us(tt); tt = tic();
             mesh.haloExchange(k1);
+            t_halo_us += us(tt);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k2[eq].data(), k1[eq].data(), 0.5, numNodes);
+            tt = tic();
             /** [2] Step R-K */
             mesh.updateFlux(k2, Flux, config.v0, config.c0, config.rho0);
+            t_updFlux_us += us(tt); tt = tic();
             numStep(mesh, config, k2, Flux, 0);
+            t_numStep_us += us(tt); tt = tic();
             mesh.haloExchange(k2);
+            t_halo_us += us(tt);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k3[eq].data(), k2[eq].data(), 0.5, numNodes);
+            tt = tic();
             /** [3] Step R-K */
             mesh.updateFlux(k3, Flux, config.v0, config.c0, config.rho0);
+            t_updFlux_us += us(tt); tt = tic();
             numStep(mesh, config, k3, Flux, 0);
+            t_numStep_us += us(tt); tt = tic();
             mesh.haloExchange(k3);
+            t_halo_us += us(tt);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k4[eq].data(), k3[eq].data(), 1, numNodes);
+            tt = tic();
             /** [4] Step R-K */
             mesh.updateFlux(k4, Flux, config.v0, config.c0, config.rho0);
+            t_updFlux_us += us(tt); tt = tic();
             numStep(mesh, config, k4, Flux, 0);
+            t_numStep_us += us(tt); tt = tic();
             mesh.haloExchange(k4);
+            t_halo_us += us(tt);
             /** Concat results of R-K iterations */
             // #pragma omp parallel for
             for (int eq = 0; eq < u.size(); ++eq)
@@ -624,7 +653,9 @@ namespace solver
                 }
             }
 
+            tt = tic();
             mesh.haloExchange(u);
+            t_halo_us += us(tt);
 
 #pragma omp parallel for schedule(static) num_threads(config.numThreads)
             for (int el = elBegin; el < elEnd; ++el)
@@ -713,5 +744,15 @@ namespace solver
             for (int obs = 0; obs < config.observers.size(); ++obs)
                 obs_outfile[obs].close();
         }
+
+        // Profiling summary — printed by every rank so we can compare ranks.
+        long long t_total = t_halo_us + t_updFlux_us + t_numStep_us;
+        std::cout << "[MPI rank " << Parallel::rank() << "] RK4 hot-loop totals (s): "
+                  << "halo=" << t_halo_us / 1e6
+                  << " updFlux=" << t_updFlux_us / 1e6
+                  << " numStep=" << t_numStep_us / 1e6
+                  << " total=" << t_total / 1e6
+                  << " (halo share=" << (t_total > 0 ? 100.0 * t_halo_us / t_total : 0.0) << "%)"
+                  << std::endl;
     }
 }

@@ -265,6 +265,139 @@ Rapport de scaling + recommandations d'usage (ranks/cores/threads optimaux).
 
 ---
 
+## Phase 7 — Profilage et audit du préprocessing (1 semaine)
+
+> **Motivation (mai 2026)** : sur le cube non structuré 16k tets, le profilage
+> RK4 montre que le **hot-loop scale très bien** (efficacité 77% à 8 ranks)
+> mais le **wall-time total scale mal** (efficacité 32% à 8 ranks). Le delta
+> = setup gmsh + `Mesh::Mesh()` qui domine pour les petits cas. Pour des
+> maillages > 100k éléments, ce setup deviendra littéralement incompressible
+> avec l'API gmsh actuelle. Avant de l'optimiser, il faut le **mesurer
+> précisément**.
+
+**Objectif** : produire un rapport détaillé de la décomposition du temps de
+préprocessing pour des maillages de référence (16k, 100k, 500k, 1M+ éléments
+hex et tet) et identifier les 3 plus gros postes en termes absolus et en
+termes de scaling MPI.
+
+### Tâches
+1. **Instrumentation chrono** dans `Mesh::Mesh()`
+   - Wrapper chaque bloc majeur (`gmsh::open`, `partition`, chargement
+     éléments, Jacobiens éléments, gradients basis fcts, faces unique
+     dedup, connectivité face↔élément, Jacobiens faces, RKR matrix,
+     mass matrix) avec un timer cumulatif
+   - Sortie : tableau par rank en fin de constructeur, format CSV
+     compatible `pandas` pour analyse offline
+2. **Bench multi-tailles**
+   - Maillages cubes hex 10³, 20³, 30³, 50³, 80³ (1k → 512k éléments)
+   - Maillages cubes tets équivalents
+   - 1, 2, 4, 8 ranks pour chaque
+   - Calcul de l'efficacité `Mesh::Mesh / N` vs séquentiel
+3. **Identification des hotspots**
+   - Top 3 fonctions consommatrices en temps absolu
+   - Top 3 fonctions qui ne scalent PAS (constant en N)
+   - Cible cas d'usage industriel : cube 100³ = 1M hex
+4. **Documentation** : `docs/PROFILING.md` avec les courbes
+   et conclusions, sert d'input aux phases 8–9
+
+### Livrable
+Rapport quantitatif. Décision argumentée sur quelles phases (8 et/ou 9)
+attaquer en priorité, et avec quel budget.
+
+---
+
+## Phase 8 — Optimisation du chargement maillage (2-3 semaines)
+
+**Objectif** : éliminer/réduire le coût de `gmsh::open` et `gmsh::partition`
+qui sont aujourd'hui répétés sur chaque rank, et indépendants du nombre
+d'éléments locaux du rank.
+
+### Stratégies (à mettre en œuvre par ordre de gain attendu)
+
+#### 8.1 — Pre-partitionnement offline (gain ÷N sur partition + load)
+- Outil : `dgalerkin --prepartition mesh.msh --np N --out mesh_part_<r>.msh`
+  (mode standalone, sans MPI)
+- Implémentation : appelle `gmsh::partition(N)` une fois, puis
+  `gmsh::write` avec `Mesh.PartitionSplitMeshFiles=1` → N fichiers
+  séparés, un par partition (déjà produits par gmsh CLI :
+  `gmsh mesh.msh -part N -part_split -part_ghosts`)
+- Au runtime : chaque rank lit son fichier `mesh_part_<rank>.msh` (taille
+  ÷N en moyenne, sans la connectivité des autres partitions)
+- Conserver le path "online" (avec `gmsh::partition` runtime) en option
+  pour backward compat / petits cas
+- Documenter le workflow utilisateur dans `README.md`
+
+#### 8.2 — Lecture parallèle MPI-IO (gain sur très gros cas)
+- Pour cas > 10 M éléments, le simple parsing du `.msh` ASCII devient lent
+- Convertir le format gmsh `.msh` en un format binaire custom (HDF5 ou
+  binaire dense) pré-partitionné
+- Lecture par `MPI_File_read_at` : chaque rank lit son segment en
+  parallèle, sans contention I/O
+- Risque : doublonner la dépendance gmsh ↔ format custom, à n'attaquer
+  que si 8.1 ne suffit pas pour les cas réels
+
+#### 8.3 — Réduction du nombre d'appels gmsh API redondants
+- Auditer `Mesh::Mesh()` : certains `gmsh::model::mesh::getXxx(elType, ...)`
+  sont appelés plusieurs fois avec le même résultat (ex: `getElementsByType`
+  côté chargement et côté connectivité face)
+- Cacher les retours dans des membres temporaires partagés entre méthodes
+- Gain attendu : 20-30 % sur le `Mesh::Mesh()` total
+
+### Livrable
+- Mode pre-partitionnement opérationnel, documenté
+- Wall-time `Mesh::Mesh()` ÷ ≥ N sur cube 100k tets à n=4 et n=8
+- Conserve la rétro-compatibilité avec le mode online
+
+---
+
+## Phase 9 — Optimisation des calculs de préprocessing (2-3 semaines)
+
+**Objectif** : pour ce qui reste APRÈS phase 8 (calculs sur la portion
+locale + halo de chaque rank), réduire le coût absolu par parallélisation
+intra-rank et par algorithmes plus efficaces.
+
+### Tâches
+
+#### 9.1 — Parallélisation OpenMP des boucles de préprocessing
+- Aujourd'hui plusieurs boucles dans `Mesh::Mesh()` sont commentées
+  `// #pragma omp parallel for` (calcul des gradients de basis fcts physiques,
+  jacobien faces, normales/tangentes, RKR matrix par face)
+- Ré-activer ces pragmas avec `num_threads(config.numThreads)`, après audit
+  de thread-safety (notamment écritures dans des `std::vector` via `push_back`)
+- Mesure attendue : speedup intra-rank ~Nthreads sur les blocs purement
+  numériques (Jacobien, basis, RKR)
+
+#### 9.2 — Refactor de `getUniqueFaceNodeTags()` (potentiellement le pire offender)
+- Implémentation actuelle : double boucle O(Nf²) avec `isNCoincidentValues2d`
+  pour matcher les faces des éléments contre la liste globale `getAllFaces`
+- Pour 100k tets : ~600k face-incidences × 600k uniqueness checks → minutes
+- Solution : remplacer par un `std::unordered_map<sorted_node_tuple, face_id>`
+  → O(Nf) au lieu de O(Nf²)
+- Tester sur cube 100k tets : objectif < 1 s pour cette routine
+
+#### 9.3 — Parallélisation du `getConnectivityFaceToElement()`
+- Boucle sur faces × éléments adjacents : naturellement parallélisable
+- Utiliser un thread-local accumulator + reduction finale
+
+#### 9.4 — Cache disque des structures précalculées
+- Pour des runs répétés sur le même mesh : sauver `m_elJacobianDets`,
+  `m_elBasisFcts`, `m_elGradBasisFcts`, `m_fNormals`, `m_fTangents`,
+  `m_fBiTangents`, `m_elFOrientation`, `m_fNbrElIds`, `RKR`, `m_fIsBoundary`,
+  `m_fBC` dans un fichier binaire `<mesh>_pre.bin` à la première exécution
+- Au prochain lancement avec le même `meshFile` et la même config (hash) :
+  charger directement le cache, skip tout le préprocessing
+- Format : version + hash du mesh + dump binaire des vectors
+- Levier énorme pour les workflows où on relance la simu (changement
+  d'amplitude/source) sans toucher la géométrie : 10-100× plus rapide
+
+### Livrable
+- `Mesh::Mesh()` parallélisé OpenMP, gain ≥ Nthreads × 0.5 sur le constructeur
+- `getUniqueFaceNodeTags` complexité réduite à O(Nf) — vérifié avec timer
+- Cache disque optionnel, activable via `"meshCache": true` dans le JSON
+- Bench setup time vs taille mesh : doit être grosso linéaire (pas O(Nf²))
+
+---
+
 ## Fichiers critiques à modifier
 
 | Fichier | Modifications |
@@ -301,7 +434,7 @@ Rapport de scaling + recommandations d'usage (ranks/cores/threads optimaux).
 
 ---
 
-## Estimation totale : 9-13 semaines
+## Estimation totale : 14-19 semaines
 
 | Phase | Durée | Risque |
 |---|---|---|
@@ -309,10 +442,20 @@ Rapport de scaling + recommandations d'usage (ranks/cores/threads optimaux).
 | 2. Partitionnement | 2-3 sem | Moyen (gmsh API) |
 | 3. Halo & flux | 2-3 sem | **Élevé** (cœur du travail) |
 | 4. I/O parallèle | 1-2 sem | Faible |
-| 5. Optimisation | 2 sem | Moyen |
+| 5. Optimisation runtime | 2 sem | Moyen |
 | 6. Robustesse | 1 sem | Faible |
+| 7. Profilage préprocessing | 1 sem | Faible |
+| 8. Optim chargement maillage | 2-3 sem | Moyen (formats) |
+| 9. Optim calculs préprocessing | 2-3 sem | Moyen (refactor connectivité) |
 
 **Risques techniques principaux** :
 - Cohérence d'ordre des nœuds aux interfaces (bug subtil source d'erreurs numériques)
 - Gestion des conditions limites sur faces partitionnées (cas particulier : face de bord coupée par le partitionneur — à vérifier que gmsh ne le fait pas)
 - Déséquilibre de charge si éléments d'ordre élevé concentrés dans un sous-domaine (ParMETIS avec poids peut résoudre)
+- **Préprocessing non scalable** : sur >100k éléments, le `Mesh::Mesh()`
+  séquentiel (face dedup, Jacobiens, connectivité) devient prohibitif. Les
+  phases 7-9 adressent ce risque, mais l'audit (phase 7) doit confirmer
+  les hypothèses avant d'investir dans 8-9.
+- **Format `.msh` ASCII** : pour des cas industriels > 10 M éléments, le
+  parsing ASCII de gmsh devient le goulet absolu. La phase 8.2 (MPI-IO
+  binaire) est la seule sortie, mais coûteuse en intégration.
