@@ -270,7 +270,7 @@ if [ $? -ne 0 ]; then
 	exit 1;
 fi
 
-cmake --build "${GKLIB_BUILD_DIR}" --target GKlib -j
+cmake --build "${GKLIB_BUILD_DIR}" --target GKlib -j"${JOBS}"
 if [ $? -ne 0 ]; then
 	echo "GKlib build failed.";
 	exit 1;
@@ -318,7 +318,7 @@ if [ $? -ne 0 ]; then
 	exit 1;
 fi
 
-cmake --build "${PARMETIS_BUILD_DIR}" -j
+cmake --build "${PARMETIS_BUILD_DIR}" -j"${JOBS}"
 if [ $? -ne 0 ]; then
 	echo "ParMETIS build failed.";
 	exit 1;

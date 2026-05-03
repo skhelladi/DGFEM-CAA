@@ -486,15 +486,47 @@ namespace
 #endif
 
 #if defined(DG_HAS_PARMETIS) && defined(DG_USE_MPI)
-    MPI_Datatype parmetisIdxMpiType()
+    std::vector<int> computeParmetisPartitionSingleRank(const ExplicitPartitionInput &input,
+                                                        int partitionCount)
     {
-        if (sizeof(idx_t) == sizeof(int))
-            return MPI_INT;
-        if (sizeof(idx_t) == sizeof(long))
-            return MPI_LONG;
-        if (sizeof(idx_t) == sizeof(long long))
-            return MPI_LONG_LONG;
-        throw std::runtime_error("Unsupported idx_t size for MPI_Allgatherv.");
+        auto csr = buildCsrAdjacency<idx_t>(input);
+
+        idx_t vtxdist[2] = {0, static_cast<idx_t>(input.adjacency.size())};
+        idx_t wgtflag = 0;
+        idx_t numflag = 0;
+        idx_t ncon = 1;
+        idx_t nparts = static_cast<idx_t>(partitionCount);
+        idx_t edgecut = 0;
+        std::vector<real_t> tpwgts(static_cast<size_t>(nparts) * static_cast<size_t>(ncon),
+                                   1.0 / static_cast<real_t>(nparts));
+        std::vector<real_t> ubvec(static_cast<size_t>(ncon), 1.05);
+        idx_t options[3] = {0, 0, 0};
+        std::vector<idx_t> part(input.adjacency.size(), 0);
+
+        MPI_Comm selfComm = MPI_COMM_SELF;
+        const int status = ParMETIS_V3_PartKway(vtxdist,
+                                                csr.first.data(),
+                                                csr.second.data(),
+                                                nullptr,
+                                                nullptr,
+                                                &wgtflag,
+                                                &numflag,
+                                                &ncon,
+                                                &nparts,
+                                                tpwgts.data(),
+                                                ubvec.data(),
+                                                options,
+                                                &edgecut,
+                                                part.data(),
+                                                &selfComm);
+        if (status != METIS_OK)
+            throw std::runtime_error("ParMETIS direct API partitioning failed with status " + std::to_string(status));
+
+        std::vector<int> cellPartitions(part.size(), 1);
+        for (size_t i = 0; i < part.size(); ++i)
+            cellPartitions[i] = static_cast<int>(part[i]) + 1;
+
+        return cellPartitions;
     }
 
     void applyParmetisApiPartition(const ExplicitPartitionInput &input,
@@ -507,94 +539,18 @@ namespace
             return;
         }
 
-        const int worldSize = Parallel::size();
-        const int worldRank = Parallel::rank();
+        std::vector<int> cellPartitions;
+        if (Parallel::rank() == 0)
+            cellPartitions = computeParmetisPartitionSingleRank(input, partitionCount);
 
-        if (worldSize <= 0)
-            throw std::runtime_error("MPI world size is invalid for ParMETIS partitioning.");
+        int count = static_cast<int>(cellPartitions.size());
+        MPI_Bcast(&count, 1, MPI_INT, 0, Parallel::comm());
+        if (count <= 0)
+            throw std::runtime_error("ParMETIS broadcast produced an empty partition vector.");
+        if (Parallel::rank() != 0)
+            cellPartitions.resize(static_cast<size_t>(count));
 
-        const idx_t globalVertexCount = static_cast<idx_t>(input.adjacency.size());
-        if (globalVertexCount <= 0)
-            throw std::runtime_error("ParMETIS partitioning requires a non-empty graph.");
-
-        std::vector<idx_t> vtxdist(static_cast<size_t>(worldSize) + 1, 0);
-        const idx_t baseChunk = globalVertexCount / static_cast<idx_t>(worldSize);
-        const idx_t remainder = globalVertexCount % static_cast<idx_t>(worldSize);
-        idx_t cursor = 0;
-        for (int rank = 0; rank < worldSize; ++rank)
-        {
-            vtxdist[rank] = cursor;
-            cursor += baseChunk + ((static_cast<idx_t>(rank) < remainder) ? 1 : 0);
-        }
-        vtxdist[worldSize] = globalVertexCount;
-
-        const idx_t localStart = vtxdist[worldRank];
-        const idx_t localEnd = vtxdist[worldRank + 1];
-        const idx_t localVertexCount = localEnd - localStart;
-
-        std::vector<idx_t> xadj(static_cast<size_t>(localVertexCount) + 1, 0);
-        std::vector<idx_t> adjncy;
-        for (idx_t localIndex = 0; localIndex < localVertexCount; ++localIndex)
-        {
-            const size_t globalIndex = static_cast<size_t>(localStart + localIndex);
-            for (int neighbour : input.adjacency[globalIndex])
-                adjncy.push_back(static_cast<idx_t>(neighbour));
-
-            xadj[static_cast<size_t>(localIndex) + 1] = static_cast<idx_t>(adjncy.size());
-        }
-
-        idx_t wgtflag = 0;
-        idx_t numflag = 0;
-        idx_t ncon = 1;
-        idx_t nparts = static_cast<idx_t>(partitionCount);
-        idx_t edgecut = 0;
-        std::vector<real_t> tpwgts(static_cast<size_t>(nparts) * static_cast<size_t>(ncon),
-                                   1.0 / static_cast<real_t>(nparts));
-        std::vector<real_t> ubvec(static_cast<size_t>(ncon), 1.05);
-        idx_t options[3] = {0, 0, 0};
-        std::vector<idx_t> localPart(static_cast<size_t>(localVertexCount), 0);
-
-        MPI_Comm comm = Parallel::comm();
-        const int status = ParMETIS_V3_PartKway(vtxdist.data(),
-                                                xadj.data(),
-                                                adjncy.data(),
-                                                nullptr,
-                                                nullptr,
-                                                &wgtflag,
-                                                &numflag,
-                                                &ncon,
-                                                &nparts,
-                                                tpwgts.data(),
-                                                ubvec.data(),
-                                                options,
-                                                &edgecut,
-                                                localPart.data(),
-                                                &comm);
-        if (status != METIS_OK)
-            throw std::runtime_error("ParMETIS direct API partitioning failed with status " + std::to_string(status));
-
-        std::vector<int> recvCounts(static_cast<size_t>(worldSize), 0);
-        std::vector<int> displs(static_cast<size_t>(worldSize), 0);
-        for (int rank = 0; rank < worldSize; ++rank)
-        {
-            recvCounts[rank] = static_cast<int>(vtxdist[rank + 1] - vtxdist[rank]);
-            displs[rank] = static_cast<int>(vtxdist[rank]);
-        }
-
-        std::vector<idx_t> gatheredPart(static_cast<size_t>(globalVertexCount), 0);
-        const MPI_Datatype idxType = parmetisIdxMpiType();
-        MPI_Allgatherv(localPart.data(),
-                       static_cast<int>(localPart.size()),
-                   idxType,
-                       gatheredPart.data(),
-                       recvCounts.data(),
-                       displs.data(),
-                   idxType,
-                       Parallel::comm());
-
-        std::vector<int> cellPartitions(gatheredPart.size(), 1);
-        for (size_t i = 0; i < gatheredPart.size(); ++i)
-            cellPartitions[i] = static_cast<int>(gatheredPart[i]) + 1;
+        MPI_Bcast(cellPartitions.data(), count, MPI_INT, 0, Parallel::comm());
 
         applyExplicitPartitionToModel(input, partitionCount, cellPartitions);
     }
