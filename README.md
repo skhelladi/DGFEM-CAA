@@ -14,8 +14,9 @@ The solver is based on [GMSH](http://gmsh.info/) library and supports a wide ran
 - Support 'json' format configartion file
 - Multiple sources support: monopoles, dipoles, quadrupoles, user defined analytical formulation sources and external data (csv and sound 'wave' file supported) 
 - Complex geometry and unstructured grid
-- Optional MPI parallelization for distributed runs
-- VTK post-processing, including `.pvtu`/`.pvd` outputs in MPI mode (use [Paraview](https://www.paraview.org/)) 
+- MPI distributed runs with owned/halo elements, rank-to-rank halo exchanges and `.pvtu`/`.pvd` outputs
+- Runtime and preprocessed mesh partition workflows for larger runs
+- VTK post-processing, including one `.vtu` file per rank and `.pvtu`/`.pvd` aggregators in MPI mode (use [Paraview](https://www.paraview.org/)) 
 - User defined obervers position post-processing (text data time variables, Fast Fourier Transform, Pressure Power Spectral Density and sound 'wave' files)
 
 Mesh support status:
@@ -44,6 +45,7 @@ First, make sure the following libraries are installed. If you are running a lin
 - VTK (v9.x)
 - FFTW
 - MPI implementation when building with `-DDG_USE_MPI=ON` (`mpich` on macOS via `build.sh`, `openmpi` on Linux via `build.sh`)
+- Optional partitioning libraries for advanced partition backends: METIS, ParMETIS and Scotch
 
 
 ### Installing
@@ -53,7 +55,7 @@ cd DGFEM-CAA
 sh build.sh
 ```
 
-To enable MPI with the setup script:
+MPI support is enabled by default in the current CMake configuration. To be explicit with the setup script:
 
 ```
 git clone https://github.com/skhelladi/DGFEM-CAA.git
@@ -79,6 +81,8 @@ mkdir build-mpi && cd build-mpi
 cmake .. -DCMAKE_BUILD_TYPE=Release -DDG_USE_MPI=ON
 make -j4
 ```
+
+To build a serial-only binary, configure with `-DDG_USE_MPI=OFF`.
 
 ## Running the tests
 Once the sources sucessfully build, you can start using the solver. It requires a configuration file that references the mesh file and the solver options. Example configurations are provided in [tests](tests) and [doc/config](doc/config).
@@ -119,11 +123,119 @@ mpirun -n 2 ./dgalerkin ../../tests/square.json
 
 MPI writes one `.vtu` file per rank together with a `.pvtu` aggregator and a `results.pvd` time-series file.
 
+3D high-order MPI regression case:
+
+```
+mpirun -n 2 ./build/bin/dgalerkin tests/cube_unstr.json
+```
+
 Current regression cases in [tests](tests):
 
 - [tests/square.json](tests/square.json): 2D quadrilateral mesh
 - [tests/cube.json](tests/cube.json): 3D tetrahedral cube mesh
 - [tests/cube_unstr.json](tests/cube_unstr.json): additional 3D cube case
+
+## MPI distributed execution
+
+The code has moved from a mostly replicated execution model to a distributed MPI model. Each rank now stores its owned elements plus the ghost elements needed to compute interface fluxes. Interior and boundary faces are kept local, interface faces drive halo construction, and the solver updates only owned elements while reading ghost values after halo exchange.
+
+Current MPI data path:
+
+- The mesh is read through Gmsh on each rank.
+- For `mpirun -n N`, the mesh is partitioned into `N` partitions, with ghost cells and partition topology enabled.
+- Each rank loads its owned cell entities first, then its halo cell entities.
+- Face connectivity is reconstructed locally using complete high-order face node keys.
+- Halo exchange is non-blocking internally (`MPI_Irecv`/`MPI_Isend`/`MPI_Waitall`) and sends all equations for each halo element.
+- In high-order 3D cases, face normals are computed from the Gmsh face Jacobian tangents.
+
+The default runtime partition mode is `gmsh`. Other modes can be requested in the JSON mesh block or legacy `.conf` files with `partitionMode` and `partitionCommand`. Supported direct or command-backed modes depend on what was found at configure time:
+
+- `gmsh`
+- `metis`, `gpmetis`, `pmetis`
+- `parmetis`
+- `scotch`, `ptscotch`, `dgpart`
+- `gpmetis-bin`, `metis-bin`, `pmetis-bin`
+- `scotch-bin`, `dgpart-bin`, `ptscotch-bin`
+
+Example JSON mesh block with an explicit partition mode:
+
+```json
+"mesh": {
+  "File": "tests/cube_unstr.msh",
+  "partitionMode": "gmsh",
+  "BC": {
+    "number": 2,
+    "boundary1": {"name": "abs", "type": "Absorbing"},
+    "boundary2": {"name": "ref", "type": "Reflecting"}
+  }
+}
+```
+
+### Preprocessed partitions
+
+For repeated runs, the `dgmesh_preprocess` executable can create a partitioned mesh and one JSON package per rank:
+
+```
+./build/bin/dgmesh_preprocess tests/cube_unstr.json tmp/cube_unstr_p2 2 gmsh
+```
+
+The output directory contains:
+
+- `partitioned.msh`: the partitioned Gmsh mesh
+- `manifest.json`: package manifest
+- `part_0.json`, `part_1.json`, ...: rank-local layout metadata
+
+The solver can consume the manifest from the input configuration:
+
+```json
+"mesh": {
+  "File": "tests/cube_unstr.msh",
+  "partitionManifest": "tmp/cube_unstr_p2/manifest.json",
+  "BC": {
+    "number": 2,
+    "boundary1": {"name": "abs", "type": "Absorbing"},
+    "boundary2": {"name": "ref", "type": "Reflecting"}
+  }
+}
+```
+
+The current preprocessed path still uses the partitioned `.msh` and rank layout metadata; the long-term target is a fully local mesh package that avoids replicated startup work.
+
+### MPI validation and profiling
+
+Halo consistency can be checked without running the full solver:
+
+```
+mpirun -n 2 ./build/bin/dg_halo_invariants tests/cube_unstr.json
+```
+
+A residual regression helper compares 1-rank and multi-rank runs:
+
+```
+scripts/check_mpi_regression.sh --case cube_unstr --baseline-ranks 1 --mpi-ranks 2
+```
+
+Scaling measurements can be collected with:
+
+```
+scripts/scaling_mpi.sh --cases square,cube,cube_unstr --ranks 1,2,4 --modes on,off
+```
+
+Useful runtime flags:
+
+- `DG_PROFILE_PHASES=1`: emit phase-level profiler CSV lines
+- `DG_PROFILE_SOLVER=1`: emit solver-stage profiler CSV lines
+- `DG_ENABLE_HALO_OVERLAP=1`: enable the experimental halo-overlap path
+- `DG_DISABLE_HALO_OVERLAP=1`: force the simpler blocking halo schedule around the non-blocking exchange
+- `DG_MPI_VERBOSE_ALL_RANKS=1`: keep logs from every MPI rank
+
+Known limitations of the current MPI transition:
+
+- Startup is still largely replicated because every rank opens the Gmsh model.
+- Runtime Gmsh partitioning can dominate small and medium cases.
+- VTU output is per rank and can become expensive when written frequently.
+- Strong scaling is limited when the local element count per rank becomes too small compared with halo, output and reduction costs.
+- The communication layer uses non-blocking point-to-point exchanges, but persistent requests and MPI neighborhood collectives are not implemented yet.
 
 or configure run_caa batch file with the right mesh and configurations files.
 
@@ -328,4 +440,3 @@ This project is licensed under the GPL-3 license.
 * Tom Servais
 
 Link : https://github.com/pvanberg/DGFEM-Acoustic
-
