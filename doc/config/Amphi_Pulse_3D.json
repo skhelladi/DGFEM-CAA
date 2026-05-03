@@ -1,0 +1,73 @@
+{
+	"mesh": {
+		"File": "auditorium.msh",
+		"BC": {
+			"number": 3,
+			"boundary1": {
+				"name": "Reflecting",
+				"type": "Reflecting"
+			},
+			"boundary2": {
+				"name": "Absorbing",
+				"type": "Absorbing"
+			},
+			"boundary3": {
+				"name": "MyPhysicalName",
+				"type": "Absorbing"
+			}
+		}
+	},
+	"solver": {
+		"time": {
+			"start": 0.0,
+			"end": 0.2,
+			"step": 1e-5,
+			"rate": 0.0001
+		},
+		"elementType": "Lagrange",
+		"timeIntMethod": "Runge-Kutta",
+		"numThreads": 4
+	},
+	"initialization": {
+		"meanFlow": {
+			"vx": 0.0,
+			"vy": 0.0,
+			"vz": 0.0,
+			"rho": 1.225,
+			"c": 343.0
+		},
+		"number": 1,
+		"initialCondition1": {
+			"type": "gaussian",
+			"x": 6.5,
+			"y": 6.5,
+			"z": 1.8,
+			"size": 1.0,
+			"amplitude": 0.05
+		}
+	},
+	"observers": {
+		"number": 1,
+		"observer1": {
+			"x": 6.5,
+			"y": 6.5,
+			"z": 1.8,
+			"size": 1.0
+		}
+	},
+	"sources": {
+		"number": 0,
+		"source1": {
+			"type": "formula",
+			"fct": "0.0",
+			"x": 0.0,
+			"y": 0.0,
+			"z": 0.0,
+			"size": 0.0,
+			"amplitude": 0.0,
+			"frequency": 0.0,
+			"phase": 0.0,
+			"duration": 0.0
+		}
+	}
+}

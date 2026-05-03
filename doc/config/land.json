@@ -1,0 +1,89 @@
+{
+	"mesh": {
+		"File": "doc/3d/land.msh",
+		"BC": {
+			"number": 3,
+			"boundary1": {
+				"name": "Reflecting",
+				"type": "Reflecting"
+			},
+			"boundary2": {
+				"name": "Absorbing",
+				"type": "Absorbing"
+			},
+			"boundary3": {
+				"name": "MyPhysicalName",
+				"type": "Absorbing"
+			}
+		}
+	},
+	"solver": {
+		"time": {
+			"start": 0.0,
+			"end": 5.0,
+			"step": 0.001,
+			"rate": 0.01
+		},
+		"elementType": "Lagrange",
+		"timeIntMethod": "Runge-Kutta",
+		"numThreads": 1
+	},
+	"initialization": {
+		"meanFlow": {
+			"vx": 0.0,
+			"vy": 7.0,
+			"vz": 0.0,
+			"rho": 1.225,
+			"c": 343.0
+		},
+		"number": 0
+	},
+	"observers": {
+		"number": 1,
+		"observer1": {
+			"x": 0.0,
+			"y": 0.0,
+			"z": 100.0,
+			"size": 1.0
+		}
+	},
+	"sources": {
+		"number": 3,
+		"source1": {
+			"type": "formula",
+			"fct": "monopole",
+			"x": -450.0,
+			"y": 300.0,
+			"z": 100.0,
+			"size": 75.0,
+			"amplitude": 2.0,
+			"frequency": 5.0,
+			"phase": 0.0,
+			"duration": 5.0
+		},
+		"source2": {
+			"type": "formula",
+			"fct": "monopole",
+			"x": -320.0,
+			"y": -400.0,
+			"z": 100.0,
+			"size": 75.0,
+			"amplitude": 2.0,
+			"frequency": 5.0,
+			"phase": 0.0,
+			"duration": 5.0
+		},
+		"source3": {
+			"type": "formula",
+			"fct": "monopole",
+			"x": -470.0,
+			"y": -250.0,
+			"z": 100.0,
+			"size": 75.0,
+			"amplitude": 2.0,
+			"frequency": 5.0,
+			"phase": 0.0,
+			"duration": 5.0
+		}
+	}
+}
