@@ -196,6 +196,14 @@ public:
     {
         return m_elNodeTags;
     }
+    inline double nodeCoord(size_t node, int axis) const
+    {
+        return m_nodeCoords[node * 3 + axis];
+    }
+    const std::vector<double> &getNodeCoords() const
+    {
+        return m_nodeCoords;
+    }
 
 #ifdef DG_USE_MPI
     int getLocalElStart() const { return m_localElStart; }
@@ -224,6 +232,8 @@ public:
     void updateFlux(std::vector<std::vector<double>> &u, std::vector<std::vector<std::vector<double>>> &Flux,
                     std::vector<double> &v0, double c0, double rho0);
     void haloExchange(std::vector<std::vector<double>> &u);
+    void haloExchangeBegin(std::vector<std::vector<double>> &u);
+    void haloExchangeEnd(std::vector<std::vector<double>> &u);
 
     /**
      * @brief Write VTK
@@ -316,6 +326,9 @@ private:
     std::vector<double> m_fFlux;          // Flux through all faces
                                           // [f1n1, f1n2, ..., f2n1, f2n2, ...]
 
+    // Coordinates (x,y,z) aligned with m_elNodeTags indexing.
+    std::vector<double> m_nodeCoords;
+
     std::vector<bool> m_fIsBoundary; // Is Face a boundary
     std::vector<size_t> m_fBC;       // Boundary type
 
@@ -327,6 +340,15 @@ private:
     std::vector<std::vector<std::vector<double>>> FluxGhost; // Ghost flux
 
 #ifdef DG_USE_MPI
+    struct HaloCommPlan
+    {
+        int rank = -1;
+        std::vector<size_t> sendEls;
+        std::vector<size_t> recvEls;
+        std::vector<double> sendBuffer;
+        std::vector<double> recvBuffer;
+    };
+
     // --- MPI partition ---
     // Element ownership: rank p owns elements [m_localElStart, m_localElEnd)
     std::vector<int> m_elOwnerRank;   // owning rank for each element (global index)
@@ -347,6 +369,9 @@ private:
     // no local neighbour (i.e. halo-only faces) contribute to no local
     // element's right-hand side → skipped by precomputeFlux.
     std::vector<size_t> m_localFaces;
+    std::vector<HaloCommPlan> m_haloCommPlans;
+    std::vector<MPI_Request> m_haloPendingRequests;
+    bool m_haloExchangePending = false;
 
     void partitionMesh();   // balanced range partition of elements
     void classifyFaces();   // tag faces as internal / interface / boundary

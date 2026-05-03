@@ -195,6 +195,44 @@ Mesh::Mesh(Config config) : config(config)
 
     m_elNumIntPts = (int)m_elJacobianDets.size() / m_elNum;
 
+    pt = prof_clk::now();
+    m_nodeCoords.assign(m_elNodeTags.size() * 3, 0.0);
+    {
+        std::vector<std::size_t> gmshNodeTags;
+        std::vector<double> gmshNodeCoords;
+        std::vector<double> gmshNodeParams;
+        gmsh::model::mesh::getNodes(gmshNodeTags, gmshNodeCoords, gmshNodeParams);
+
+        std::unordered_map<std::size_t, std::size_t> tagToCoordOffset;
+        tagToCoordOffset.reserve(gmshNodeTags.size());
+        for (std::size_t i = 0; i < gmshNodeTags.size(); ++i)
+            tagToCoordOffset[gmshNodeTags[i]] = i * 3;
+
+        std::vector<double> coord;
+        std::vector<double> paramCoord;
+        for (std::size_t n = 0; n < m_elNodeTags.size(); ++n)
+        {
+            const std::size_t nodeTag = m_elNodeTags[n];
+            const auto it = tagToCoordOffset.find(nodeTag);
+            if (it != tagToCoordOffset.end())
+            {
+                m_nodeCoords[n * 3 + 0] = gmshNodeCoords[it->second + 0];
+                m_nodeCoords[n * 3 + 1] = gmshNodeCoords[it->second + 1];
+                m_nodeCoords[n * 3 + 2] = gmshNodeCoords[it->second + 2];
+            }
+            else
+            {
+                int _dim = 0;
+                int _tag = 0;
+                gmsh::model::mesh::getNode(nodeTag, coord, paramCoord, _dim, _tag);
+                m_nodeCoords[n * 3 + 0] = coord[0];
+                m_nodeCoords[n * 3 + 1] = coord[1];
+                m_nodeCoords[n * 3 + 2] = coord[2];
+            }
+        }
+    }
+    profMark("03e_cache_node_coords", pt);
+
     auto end = std::chrono::system_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
@@ -602,17 +640,19 @@ Mesh::Mesh(Config config) : config(config)
 
     pt = prof_clk::now();
     double dotProduct;
-    std::vector<double> m_elBarycenters, fNodeCoord(3), elOuterDir(3), paramCoords;
-#ifdef DG_USE_MPI
-    if (Parallel::size() > 1)
+    std::vector<double> m_elBarycenters(m_elNum * 3, 0.0), fNodeCoord(3), elOuterDir(3), paramCoords;
+    for (size_t el = 0; el < m_elNum; ++el)
     {
-        const PartitionLayout &layout = getRuntimePartitionLayout();
-        loadBarycentersByPartition(layout, m_elType[0], m_elBarycenters);
-    }
-    else
-#endif
-    {
-        gmsh::model::mesh::getBarycenters(m_elType[0], -1, false, true, m_elBarycenters);
+        for (int n = 0; n < _numPrimaryNodes; ++n)
+        {
+            const size_t nodeIndex = el * m_elNumNodes + static_cast<size_t>(n);
+            m_elBarycenters[el * 3 + 0] += m_nodeCoords[nodeIndex * 3 + 0];
+            m_elBarycenters[el * 3 + 1] += m_nodeCoords[nodeIndex * 3 + 1];
+            m_elBarycenters[el * 3 + 2] += m_nodeCoords[nodeIndex * 3 + 2];
+        }
+        m_elBarycenters[el * 3 + 0] /= static_cast<double>(_numPrimaryNodes);
+        m_elBarycenters[el * 3 + 1] /= static_cast<double>(_numPrimaryNodes);
+        m_elBarycenters[el * 3 + 2] /= static_cast<double>(_numPrimaryNodes);
     }
 
     m_elFOrientation.clear();
@@ -623,14 +663,30 @@ Mesh::Mesh(Config config) : config(config)
         {
             dotProduct = 0.0;
 
-            int _dim, _tag;
+            const size_t faceId = elFId(el, f);
+            int faceElSlot = -1;
+            for (size_t slot = 0; slot < m_fNbrElIds[faceId].size(); ++slot)
+            {
+                if (m_fNbrElIds[faceId][slot] == el)
+                {
+                    faceElSlot = static_cast<int>(slot);
+                    break;
+                }
+            }
 
-            gmsh::model::mesh::getNode(elFNodeTag(el, f), fNodeCoord, paramCoords, _dim, _tag);
+            if (faceElSlot < 0)
+                Fatal_Error("Face-to-element orientation mapping error");
+
+            const int localFaceNode = fNToElNId(faceId, 0, faceElSlot);
+            const size_t nodeIndex = el * m_elNumNodes + static_cast<size_t>(localFaceNode);
+            fNodeCoord[0] = m_nodeCoords[nodeIndex * 3 + 0];
+            fNodeCoord[1] = m_nodeCoords[nodeIndex * 3 + 1];
+            fNodeCoord[2] = m_nodeCoords[nodeIndex * 3 + 2];
 
             for (int x = 0; x < m_Dim; x++)
             {
                 elOuterDir[x] = fNodeCoord[x] - m_elBarycenters[el * 3 + x];
-                dotProduct += elOuterDir[x] * fNormal(elFId(el, f), 0, x);
+                dotProduct += elOuterDir[x] * fNormal(faceId, 0, x);
             }
 
             size_t value = (dotProduct >= 0) ? 1 : -1;
@@ -661,7 +717,7 @@ Mesh::Mesh(Config config) : config(config)
             if (elFId(fNbrElId(f, 0), lf) == f)
                 elf = lf;
         }
-        if (m_fNbrElIds.size() == 2)
+        if (m_fNbrElIds[f].size() == 2)
         {
             if (elFOrientation(fNbrElId(f, 0), elf) <= 0)
             {
@@ -945,6 +1001,10 @@ void Mesh::classifyFaces()
 void Mesh::buildHalo()
 {
     int myRank = Parallel::rank();
+    m_haloFaces.clear();
+    m_haloSendElIds.clear();
+    m_haloRecvElIds.clear();
+    m_haloCommPlans.clear();
 
     for (int f = 0; f < m_fNum; ++f)
     {
@@ -980,6 +1040,34 @@ void Mesh::buildHalo()
     };
     for (auto &kv : m_haloSendElIds) sortByGmshTag(kv.second);
     for (auto &kv : m_haloRecvElIds) sortByGmshTag(kv.second);
+
+    const int fieldCount = 4;
+    const int dofsPerEl = m_elNumNodes;
+    if (fieldCount > 0 && dofsPerEl > 0)
+    {
+        std::set<int> neighbours;
+        for (const auto &kv : m_haloSendElIds) neighbours.insert(kv.first);
+        for (const auto &kv : m_haloRecvElIds) neighbours.insert(kv.first);
+
+        m_haloCommPlans.reserve(neighbours.size());
+        for (int rank : neighbours)
+        {
+            HaloCommPlan plan;
+            plan.rank = rank;
+
+            auto sendIt = m_haloSendElIds.find(rank);
+            if (sendIt != m_haloSendElIds.end())
+                plan.sendEls = sendIt->second;
+
+            auto recvIt = m_haloRecvElIds.find(rank);
+            if (recvIt != m_haloRecvElIds.end())
+                plan.recvEls = recvIt->second;
+
+            plan.sendBuffer.resize(plan.sendEls.size() * static_cast<size_t>(fieldCount) * static_cast<size_t>(dofsPerEl));
+            plan.recvBuffer.resize(plan.recvEls.size() * static_cast<size_t>(fieldCount) * static_cast<size_t>(dofsPerEl));
+            m_haloCommPlans.push_back(std::move(plan));
+        }
+    }
 
     for (auto &[rank, elList] : m_haloSendElIds)
         std::cout << "[MPI rank " << myRank << "] "
@@ -1160,17 +1248,17 @@ PartitionLayout buildPartitionLayout()
 
 #endif // DG_USE_MPI
 
-void Mesh::haloExchange(std::vector<std::vector<double>> &u)
+void Mesh::haloExchangeBegin(std::vector<std::vector<double>> &u)
 {
 #ifdef DG_USE_MPI
     if (Parallel::size() <= 1)
         return;
 
-    std::set<int> neighbours;
-    for (const auto &entry : m_haloSendElIds)
-        neighbours.insert(entry.first);
-    for (const auto &entry : m_haloRecvElIds)
-        neighbours.insert(entry.first);
+    if (m_haloCommPlans.empty())
+        return;
+
+    if (m_haloExchangePending)
+        return;
 
     const int fieldCount = static_cast<int>(u.size());
     const int dofsPerEl = m_elNumNodes;
@@ -1178,48 +1266,110 @@ void Mesh::haloExchange(std::vector<std::vector<double>> &u)
     // Halo lists are sorted by gmsh element tag at construction time
     // (see buildHalo). So A's sendList[B][i] and B's recvList[A][i]
     // refer to the SAME physical element — no IDs need to be exchanged.
-    for (int neighbourRank : neighbours)
+    m_haloPendingRequests.clear();
+    m_haloPendingRequests.reserve(m_haloCommPlans.size() * 2);
+
+    for (auto &plan : m_haloCommPlans)
     {
-        const auto sendIt = m_haloSendElIds.find(neighbourRank);
-        const auto recvIt = m_haloRecvElIds.find(neighbourRank);
-
-        const std::vector<size_t> emptyEls;
-        const std::vector<size_t> &sendEls = (sendIt != m_haloSendElIds.end()) ? sendIt->second : emptyEls;
-        const std::vector<size_t> &recvEls = (recvIt != m_haloRecvElIds.end()) ? recvIt->second : emptyEls;
-
-        std::vector<double> sendValues(sendEls.size() * fieldCount * dofsPerEl);
-        std::vector<double> recvValues(recvEls.size() * fieldCount * dofsPerEl);
+        const size_t expectedSend = plan.sendEls.size() * static_cast<size_t>(fieldCount) * static_cast<size_t>(dofsPerEl);
+        const size_t expectedRecv = plan.recvEls.size() * static_cast<size_t>(fieldCount) * static_cast<size_t>(dofsPerEl);
+        if (plan.sendBuffer.size() != expectedSend)
+            plan.sendBuffer.resize(expectedSend);
+        if (plan.recvBuffer.size() != expectedRecv)
+            plan.recvBuffer.resize(expectedRecv);
 
         size_t sendOffset = 0;
-        for (size_t elIndex = 0; elIndex < sendEls.size(); ++elIndex)
+        for (size_t elIndex = 0; elIndex < plan.sendEls.size(); ++elIndex)
         {
-            const size_t el = sendEls[elIndex]; // local owned-region index
+            const size_t el = plan.sendEls[elIndex]; // local owned-region index
             for (int eq = 0; eq < fieldCount; ++eq)
             {
                 std::copy_n(u[eq].begin() + el * dofsPerEl,
                             dofsPerEl,
-                            sendValues.begin() + sendOffset);
+                            plan.sendBuffer.begin() + sendOffset);
                 sendOffset += dofsPerEl;
             }
         }
 
-        MPI_Sendrecv(sendValues.data(), static_cast<int>(sendValues.size()), MPI_DOUBLE, neighbourRank, 4101,
-                     recvValues.data(), static_cast<int>(recvValues.size()), MPI_DOUBLE, neighbourRank, 4101,
-                     Parallel::comm(), MPI_STATUS_IGNORE);
-
-        size_t recvOffset = 0;
-        for (size_t elIndex = 0; elIndex < recvEls.size(); ++elIndex)
+        if (!plan.recvBuffer.empty())
         {
-            const size_t el = recvEls[elIndex]; // local halo-region index
+            MPI_Request req = MPI_REQUEST_NULL;
+            MPI_Irecv(plan.recvBuffer.data(),
+                      static_cast<int>(plan.recvBuffer.size()),
+                      MPI_DOUBLE,
+                      plan.rank,
+                      4101,
+                      Parallel::comm(),
+                      &req);
+            m_haloPendingRequests.push_back(req);
+        }
+
+        if (!plan.sendBuffer.empty())
+        {
+            MPI_Request req = MPI_REQUEST_NULL;
+            MPI_Isend(plan.sendBuffer.data(),
+                      static_cast<int>(plan.sendBuffer.size()),
+                      MPI_DOUBLE,
+                      plan.rank,
+                      4101,
+                      Parallel::comm(),
+                      &req);
+            m_haloPendingRequests.push_back(req);
+        }
+    }
+
+    m_haloExchangePending = true;
+#else
+    (void)u;
+#endif
+}
+
+void Mesh::haloExchangeEnd(std::vector<std::vector<double>> &u)
+{
+#ifdef DG_USE_MPI
+    if (Parallel::size() <= 1)
+        return;
+
+    if (m_haloCommPlans.empty())
+        return;
+
+    if (!m_haloExchangePending)
+        return;
+
+    const int fieldCount = static_cast<int>(u.size());
+    const int dofsPerEl = m_elNumNodes;
+
+    if (!m_haloPendingRequests.empty())
+        MPI_Waitall(static_cast<int>(m_haloPendingRequests.size()), m_haloPendingRequests.data(), MPI_STATUSES_IGNORE);
+
+    for (const auto &plan : m_haloCommPlans)
+    {
+        size_t recvOffset = 0;
+        for (size_t elIndex = 0; elIndex < plan.recvEls.size(); ++elIndex)
+        {
+            const size_t el = plan.recvEls[elIndex]; // local halo-region index
             for (int eq = 0; eq < fieldCount; ++eq)
             {
-                std::copy_n(recvValues.begin() + recvOffset,
+                std::copy_n(plan.recvBuffer.begin() + recvOffset,
                             dofsPerEl,
                             u[eq].begin() + el * dofsPerEl);
                 recvOffset += dofsPerEl;
             }
         }
     }
+
+    m_haloPendingRequests.clear();
+    m_haloExchangePending = false;
+#else
+    (void)u;
+#endif
+}
+
+void Mesh::haloExchange(std::vector<std::vector<double>> &u)
+{
+#ifdef DG_USE_MPI
+    haloExchangeBegin(u);
+    haloExchangeEnd(u);
 #else
     (void)u;
 #endif
@@ -1705,11 +1855,14 @@ void Mesh::getConnectivityFaceToElement()
     // isNCoincidentValues → O(Nf²). Dominated preprocessing on large hex meshes.
     // New algorithm: build a lookup map from sorted face key → unique face index,
     // then for each incidence do a single O(1) lookup.
-
+    m_fNbrElIds.clear();
     m_fNbrElIds.resize(m_fNum);
+    m_elFIds.clear();
 
     const size_t numUniqueFaces = m_fNodeTagsOrdered.size() / m_fNumNodes;
     const size_t numIncidences  = m_elFNodeTagsOrdered.size() / m_fNumNodes;
+    const bool hasQuadrilateralFaces = (m_fDim == 2 && m_fName == "quadrangle");
+    const size_t fNumNativeNodes = (m_fDim < 2) ? 2 : (hasQuadrilateralFaces ? 4 : 3);
 
     struct FaceKeyHash {
         size_t operator()(const std::array<size_t, 8> &k) const noexcept {
@@ -1721,7 +1874,7 @@ void Mesh::getConnectivityFaceToElement()
         }
     };
 
-    const size_t kNodes = std::min((size_t)m_fNumNodes, (size_t)8);
+    const size_t kNodes = std::min(fNumNativeNodes, (size_t)8);
     auto makeKey = [&](const std::vector<size_t> &tags, size_t baseIdx,
                        std::array<size_t, 8> &out) {
         for (size_t k = 0; k < kNodes; ++k)
@@ -1747,6 +1900,9 @@ void Mesh::getConnectivityFaceToElement()
         m_elFIds.push_back(fi);
         m_fNbrElIds[fi].push_back(el);
     }
+
+    if (m_elFIds.size() != numIncidences)
+        Fatal_Error("Incomplete face-to-element connectivity reconstruction");
 
     auto end = std::chrono::system_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

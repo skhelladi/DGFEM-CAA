@@ -6,12 +6,14 @@ SetFactory("OpenCASCADE");
 
 L = 100.0;   // domain side [m]
 h = 7.0;     // characteristic mesh size [m] — gives ~50-80k tets
+p = 2;       // spatial order (1: linear, 2: quadratic, ...)
 
 Box(1) = {0, 0, 0, L, L, L};
 
 // Default 2D and 3D algorithms (Delaunay) — produces tetrahedra, not hexahedra
 Mesh.Algorithm   = 6;   // Frontal-Delaunay (2D)
 Mesh.Algorithm3D = 1;   // Delaunay (3D)
+Mesh.ElementOrder = p;  // apply spatial order to mesh elements
 
 MeshSize{ PointsOf{ Volume{1}; } } = h;
 

@@ -1,4 +1,6 @@
+#include <array>
 #include <chrono>
+#include <cstdlib>
 #include <gmsh.h>
 #include <iostream>
 #include <omp.h>
@@ -13,6 +15,26 @@
 
 namespace solver
 {
+
+    bool envEnabled(const char *name)
+    {
+        const char *value = std::getenv(name);
+        if (!value)
+            return false;
+        return value[0] != '\0' && value[0] != '0';
+    }
+
+    bool useHaloOverlapMPI()
+    {
+        if (Parallel::size() <= 1)
+            return false;
+
+        if (envEnabled("DG_DISABLE_HALO_OVERLAP"))
+            return false;
+
+        // MPI default is overlap disabled unless explicitly enabled.
+        return envEnabled("DG_ENABLE_HALO_OVERLAP");
+    }
 
     /**
      * Common variables to all solver
@@ -171,6 +193,7 @@ namespace solver
     {
         const bool rootRank = Parallel::isRoot();
         const bool profileSolver = profiling::phasesEnabled("DG_PROFILE_SOLVER");
+        const bool overlapHalo = useHaloOverlapMPI();
         const int elBegin = localElBegin(mesh);
         const int elEnd = localElEnd(mesh);
         SolverStageTimers timers;
@@ -216,12 +239,9 @@ namespace solver
             std::vector<int> indice;
             for (int n = 0; n < mesh.getNumNodes(); n++)
             {
-                std::vector<double> coord, paramCoord;
-                int _dim, _tag;
-                gmsh::model::mesh::getNode(mesh.getElNodeTags()[n], coord, paramCoord, _dim, _tag);
-                if (pow(coord[0] - config.sources[i].source[1], 2) +
-                        pow(coord[1] - config.sources[i].source[2], 2) +
-                        pow(coord[2] - config.sources[i].source[3], 2) <
+                if (pow(mesh.nodeCoord(n, 0) - config.sources[i].source[1], 2) +
+                        pow(mesh.nodeCoord(n, 1) - config.sources[i].source[2], 2) +
+                        pow(mesh.nodeCoord(n, 2) - config.sources[i].source[3], 2) <
                     pow(config.sources[i].source[4], 2))
                 {
                     indice.push_back(n);
@@ -242,12 +262,9 @@ namespace solver
             std::vector<double> dist;
             for (int n = 0; n < mesh.getNumNodes(); n++)
             {
-                std::vector<double> coord, paramCoord;
-                int _dim, _tag;
-                gmsh::model::mesh::getNode(mesh.getElNodeTags()[n], coord, paramCoord, _dim, _tag);
-                double distance = sqrt(pow(coord[0] - config.observers[i][0], 2) +
-                                       pow(coord[1] - config.observers[i][1], 2) +
-                                       pow(coord[2] - config.observers[i][2], 2));
+                double distance = sqrt(pow(mesh.nodeCoord(n, 0) - config.observers[i][0], 2) +
+                                       pow(mesh.nodeCoord(n, 1) - config.observers[i][1], 2) +
+                                       pow(mesh.nodeCoord(n, 2) - config.observers[i][2], 2));
                 if (distance < config.observers[i][3])
                 {
                     indice.push_back(n);
@@ -409,16 +426,17 @@ namespace solver
             }
 
             numStep(mesh, config, u, Flux, 1, profileSolver ? &timers : nullptr);
-
-            if (profileSolver)
+            if (overlapHalo)
             {
-                tt = tic();
-                mesh.haloExchange(u);
-                timers.haloUs += us(tt);
+                mesh.haloExchangeBegin(u);
             }
             else
             {
+                if (profileSolver)
+                    tt = tic();
                 mesh.haloExchange(u);
+                if (profileSolver)
+                    timers.haloUs += us(tt);
             }
 
             /**
@@ -447,34 +465,28 @@ namespace solver
             if (profileSolver)
                 timers.residualAssemblyUs += us(tt);
 
-            if (profileSolver)
-                tt = tic();
-            std::vector<double> residualGlobal(residual.size(), 0.0);
-            Parallel::allReduce(residual.data(), residualGlobal.data(), static_cast<int>(residual.size()));
-            residual.swap(residualGlobal);
+            std::array<double, 6> reduceLocal = {residual[0], residual[1], residual[2], residual[3], residual[4],
+                                                 static_cast<double>((elEnd - elBegin) * mesh.getElNumNodes())};
+            std::array<double, 6> reduceGlobal = {0, 0, 0, 0, 0, 0};
 
-            // Global #DOFs = sum over ranks of (elEnd - elBegin) * elNumNodes.
-            // We allreduce that count too so root has the correct divisor in
-            // partitioned mode (where mesh.getElNum() is local+halo, not global).
-            int localDof  = (elEnd - elBegin) * mesh.getElNumNodes();
-            int globalDof = Parallel::allReduceScalar<int>(localDof);
-            if (profileSolver)
-                timers.reductionUs += us(tt);
-
-            auto end_time = std::chrono::system_clock::now();
-            auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            if (rootRank)
+#ifdef DG_USE_MPI
+            MPI_Request reduceReq = MPI_REQUEST_NULL;
+            bool asyncReduce = (Parallel::size() > 1);
+            if (asyncReduce)
             {
-                outfile << t << ";";
-                std::cout << std::scientific << t << "\t";
-                for (int eq = 0; eq < residual.size(); ++eq)
-                {
-                    residual[eq] /= globalDof;
-                    std::cout << std::scientific << residual[eq] << "\t";
-                    outfile << residual[eq] << ";";
-                }
-                std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
-                outfile << elapsed_time.count() * 1.0e-6 << std::endl;
+                if (profileSolver)
+                    tt = tic();
+                MPI_Iallreduce(reduceLocal.data(), reduceGlobal.data(), static_cast<int>(reduceLocal.size()),
+                               MPI_DOUBLE, MPI_SUM, Parallel::comm(), &reduceReq);
+            }
+            else
+#endif
+            {
+                if (profileSolver)
+                    tt = tic();
+                Parallel::allReduce(reduceLocal.data(), reduceGlobal.data(), static_cast<int>(reduceLocal.size()));
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
             }
 
             /**
@@ -484,9 +496,11 @@ namespace solver
              */
             if (profileSolver)
                 tt = tic();
-            for (int obs = 0; obs < config.observers.size(); ++obs)
+            const int obsCount = static_cast<int>(config.observers.size());
+            std::vector<double> localObsPvw(obsCount * 5, 0.0);
+            for (int obs = 0; obs < obsCount; ++obs)
             {
-                double localPVW[5] = {0, 0, 0, 0, 0}; // p, vx, vy, vz, w_sum
+                double *localPVW = &localObsPvw[obs * 5]; // p, vx, vy, vz, w_sum
                 for (int n = 0; n < obsIndices[obs].size(); ++n)
                 {
                     int nodeIdx = obsIndices[obs][n];
@@ -499,21 +513,95 @@ namespace solver
                     localPVW[3] += u[3][nodeIdx] * w;
                     localPVW[4] += w;
                 }
-                double globalPVW[5] = {0, 0, 0, 0, 0};
-                Parallel::allReduce(localPVW, globalPVW, 5);
-                if (rootRank && globalPVW[4] > 0.0)
+            }
+            if (profileSolver)
+                timers.observerSamplingUs += us(tt);
+
+#ifdef DG_USE_MPI
+            if (asyncReduce)
+            {
+                MPI_Wait(&reduceReq, MPI_STATUS_IGNORE);
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+#endif
+            for (int eq = 0; eq < 5; ++eq)
+                residual[eq] = reduceGlobal[eq];
+            const int globalDof = static_cast<int>(reduceGlobal[5] + 0.5);
+            const double postStepTime = (t + config.timeStep <= config.timeEnd) ? (t + config.timeStep) : config.timeEnd;
+
+            auto end_time = std::chrono::system_clock::now();
+            auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            if (rootRank)
+            {
+                outfile << postStepTime << ";";
+                std::cout << std::scientific << postStepTime << "\t";
+                for (int eq = 0; eq < residual.size(); ++eq)
                 {
+                    residual[eq] /= globalDof;
+                    std::cout << std::scientific << residual[eq] << "\t";
+                    outfile << residual[eq] << ";";
+                }
+                std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
+                outfile << elapsed_time.count() * 1.0e-6 << std::endl;
+            }
+
+            std::vector<double> globalObsPvw(obsCount * 5, 0.0);
+#ifdef DG_USE_MPI
+            MPI_Request obsReq = MPI_REQUEST_NULL;
+            bool asyncObsReduce = (Parallel::size() > 1 && obsCount > 0);
+            if (asyncObsReduce)
+            {
+                if (profileSolver)
+                    tt = tic();
+                MPI_Iallreduce(localObsPvw.data(), globalObsPvw.data(), obsCount * 5,
+                               MPI_DOUBLE, MPI_SUM, Parallel::comm(), &obsReq);
+            }
+            else
+#endif
+            if (obsCount > 0)
+            {
+                if (profileSolver)
+                    tt = tic();
+                Parallel::allReduce(localObsPvw.data(), globalObsPvw.data(), obsCount * 5);
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+
+            if (overlapHalo)
+            {
+                if (profileSolver)
+                    tt = tic();
+                mesh.haloExchangeEnd(u);
+                if (profileSolver)
+                    timers.haloUs += us(tt);
+            }
+
+#ifdef DG_USE_MPI
+            if (asyncObsReduce)
+            {
+                MPI_Wait(&obsReq, MPI_STATUS_IGNORE);
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+#endif
+
+            if (rootRank)
+            {
+                for (int obs = 0; obs < obsCount; ++obs)
+                {
+                    const double *globalPVW = &globalObsPvw[obs * 5];
+                    if (globalPVW[4] <= 0.0)
+                        continue;
                     double p   = globalPVW[0] / globalPVW[4];
                     double vx  = globalPVW[1] / globalPVW[4];
                     double vy  = globalPVW[2] / globalPVW[4];
                     double vz  = globalPVW[3] / globalPVW[4];
                     double rho = p / pow(config.c0, 2);
                     data4wave[obs].push_back(p);
-                    obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
+                    obs_outfile[obs] << postStepTime << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
                 }
             }
-            if (profileSolver)
-                timers.observerSamplingUs += us(tt);
         }
         if (rootRank)
         {
@@ -547,6 +635,7 @@ namespace solver
     {
         const bool rootRank = Parallel::isRoot();
         const bool profileSolver = profiling::phasesEnabled("DG_PROFILE_SOLVER");
+        const bool overlapHalo = useHaloOverlapMPI();
         const int elBegin = localElBegin(mesh);
         const int elEnd = localElEnd(mesh);
         SolverStageTimers timers;
@@ -597,12 +686,9 @@ namespace solver
             std::vector<int> indice;
             for (int n = 0; n < mesh.getNumNodes(); n++)
             {
-                std::vector<double> coord, paramCoord;
-                int _dim, _tag;
-                gmsh::model::mesh::getNode(mesh.getElNodeTags()[n], coord, paramCoord, _dim, _tag);
-                if (pow(coord[0] - config.sources[i].source[1], 2) +
-                        pow(coord[1] - config.sources[i].source[2], 2) +
-                        pow(coord[2] - config.sources[i].source[3], 2) <
+                if (pow(mesh.nodeCoord(n, 0) - config.sources[i].source[1], 2) +
+                        pow(mesh.nodeCoord(n, 1) - config.sources[i].source[2], 2) +
+                        pow(mesh.nodeCoord(n, 2) - config.sources[i].source[3], 2) <
                     pow(config.sources[i].source[4], 2))
                 {
                     indice.push_back(n);
@@ -623,12 +709,9 @@ namespace solver
             std::vector<double> dist;
             for (int n = 0; n < mesh.getNumNodes(); n++)
             {
-                std::vector<double> coord, paramCoord;
-                int _dim, _tag;
-                gmsh::model::mesh::getNode(mesh.getElNodeTags()[n], coord, paramCoord, _dim, _tag);
-                double distance = sqrt(pow(coord[0] - config.observers[i][0], 2) +
-                                       pow(coord[1] - config.observers[i][1], 2) +
-                                       pow(coord[2] - config.observers[i][2], 2));
+                double distance = sqrt(pow(mesh.nodeCoord(n, 0) - config.observers[i][0], 2) +
+                                       pow(mesh.nodeCoord(n, 1) - config.observers[i][1], 2) +
+                                       pow(mesh.nodeCoord(n, 2) - config.observers[i][2], 2));
                 if (distance < config.observers[i][3])
                 {
                     indice.push_back(n);
@@ -850,10 +933,18 @@ namespace solver
                 }
             }
 
-            tt = tic();
-            mesh.haloExchange(u);
-            if (profileSolver)
-                timers.haloUs += us(tt);
+            if (overlapHalo)
+            {
+                mesh.haloExchangeBegin(u);
+            }
+            else
+            {
+                if (profileSolver)
+                    tt = tic();
+                mesh.haloExchange(u);
+                if (profileSolver)
+                    timers.haloUs += us(tt);
+            }
 
             if (profileSolver)
                 tt = tic();
@@ -878,32 +969,30 @@ namespace solver
             if (profileSolver)
                 timers.residualAssemblyUs += us(tt);
 
-            if (profileSolver)
-                tt = tic();
-            std::vector<double> residualGlobal(residual.size(), 0.0);
-            Parallel::allReduce(residual.data(), residualGlobal.data(), static_cast<int>(residual.size()));
-            residual.swap(residualGlobal);
+            std::array<double, 6> reduceLocal = {residual[0], residual[1], residual[2], residual[3], residual[4],
+                                                 static_cast<double>((elEnd - elBegin) * mesh.getElNumNodes())};
+            std::array<double, 6> reduceGlobal = {0, 0, 0, 0, 0, 0};
 
-            int localDof  = (elEnd - elBegin) * mesh.getElNumNodes();
-            int globalDof = Parallel::allReduceScalar<int>(localDof);
-            if (profileSolver)
-                timers.reductionUs += us(tt);
-
-            auto end_time = std::chrono::system_clock::now();
-            auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-            if (rootRank)
+#ifdef DG_USE_MPI
+            MPI_Request reduceReq = MPI_REQUEST_NULL;
+            bool asyncReduce = (Parallel::size() > 1);
+            if (asyncReduce)
             {
-                outfile << t << ";";
-                std::cout << std::scientific << t << "\t";
-                for (int eq = 0; eq < residual.size(); ++eq)
-                {
-                    residual[eq] /= globalDof;
-                    std::cout << std::scientific << residual[eq] << "\t";
-                    outfile << residual[eq] << ";";
-                }
-                std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
-                outfile << elapsed_time.count() * 1.0e-6 << std::endl;
+                if (profileSolver)
+                    tt = tic();
+                MPI_Iallreduce(reduceLocal.data(), reduceGlobal.data(), static_cast<int>(reduceLocal.size()),
+                               MPI_DOUBLE, MPI_SUM, Parallel::comm(), &reduceReq);
             }
+            else
+#endif
+            {
+                if (profileSolver)
+                    tt = tic();
+                Parallel::allReduce(reduceLocal.data(), reduceGlobal.data(), static_cast<int>(reduceLocal.size()));
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+
             /**
              * get observers value
              * Inverse-distance interpolation. Each rank accumulates local
@@ -911,9 +1000,11 @@ namespace solver
              */
             if (profileSolver)
                 tt = tic();
-            for (int obs = 0; obs < config.observers.size(); ++obs)
+            const int obsCount = static_cast<int>(config.observers.size());
+            std::vector<double> localObsPvw(obsCount * 5, 0.0);
+            for (int obs = 0; obs < obsCount; ++obs)
             {
-                double localPVW[5] = {0, 0, 0, 0, 0}; // p, vx, vy, vz, w_sum
+                double *localPVW = &localObsPvw[obs * 5]; // p, vx, vy, vz, w_sum
                 for (int n = 0; n < obsIndices[obs].size(); ++n)
                 {
                     int nodeIdx = obsIndices[obs][n];
@@ -926,21 +1017,95 @@ namespace solver
                     localPVW[3] += u[3][nodeIdx] * w;
                     localPVW[4] += w;
                 }
-                double globalPVW[5] = {0, 0, 0, 0, 0};
-                Parallel::allReduce(localPVW, globalPVW, 5);
-                if (rootRank && globalPVW[4] > 0.0)
+            }
+            if (profileSolver)
+                timers.observerSamplingUs += us(tt);
+
+#ifdef DG_USE_MPI
+            if (asyncReduce)
+            {
+                MPI_Wait(&reduceReq, MPI_STATUS_IGNORE);
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+#endif
+            for (int eq = 0; eq < 5; ++eq)
+                residual[eq] = reduceGlobal[eq];
+            const int globalDof = static_cast<int>(reduceGlobal[5] + 0.5);
+            const double postStepTime = (t + config.timeStep <= config.timeEnd) ? (t + config.timeStep) : config.timeEnd;
+
+            auto end_time = std::chrono::system_clock::now();
+            auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+            if (rootRank)
+            {
+                outfile << postStepTime << ";";
+                std::cout << std::scientific << postStepTime << "\t";
+                for (int eq = 0; eq < residual.size(); ++eq)
                 {
+                    residual[eq] /= globalDof;
+                    std::cout << std::scientific << residual[eq] << "\t";
+                    outfile << residual[eq] << ";";
+                }
+                std::cout << elapsed_time.count() * 1.0e-6 << " s" << std::endl;
+                outfile << elapsed_time.count() * 1.0e-6 << std::endl;
+            }
+
+            std::vector<double> globalObsPvw(obsCount * 5, 0.0);
+#ifdef DG_USE_MPI
+            MPI_Request obsReq = MPI_REQUEST_NULL;
+            bool asyncObsReduce = (Parallel::size() > 1 && obsCount > 0);
+            if (asyncObsReduce)
+            {
+                if (profileSolver)
+                    tt = tic();
+                MPI_Iallreduce(localObsPvw.data(), globalObsPvw.data(), obsCount * 5,
+                               MPI_DOUBLE, MPI_SUM, Parallel::comm(), &obsReq);
+            }
+            else
+#endif
+            if (obsCount > 0)
+            {
+                if (profileSolver)
+                    tt = tic();
+                Parallel::allReduce(localObsPvw.data(), globalObsPvw.data(), obsCount * 5);
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+
+            if (overlapHalo)
+            {
+                if (profileSolver)
+                    tt = tic();
+                mesh.haloExchangeEnd(u);
+                if (profileSolver)
+                    timers.haloUs += us(tt);
+            }
+
+#ifdef DG_USE_MPI
+            if (asyncObsReduce)
+            {
+                MPI_Wait(&obsReq, MPI_STATUS_IGNORE);
+                if (profileSolver)
+                    timers.reductionUs += us(tt);
+            }
+#endif
+
+            if (rootRank)
+            {
+                for (int obs = 0; obs < obsCount; ++obs)
+                {
+                    const double *globalPVW = &globalObsPvw[obs * 5];
+                    if (globalPVW[4] <= 0.0)
+                        continue;
                     double p   = globalPVW[0] / globalPVW[4];
                     double vx  = globalPVW[1] / globalPVW[4];
                     double vy  = globalPVW[2] / globalPVW[4];
                     double vz  = globalPVW[3] / globalPVW[4];
                     double rho = p / pow(config.c0, 2);
                     data4wave[obs].push_back(p);
-                    obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
+                    obs_outfile[obs] << postStepTime << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
                 }
             }
-            if (profileSolver)
-                timers.observerSamplingUs += us(tt);
         }
         if (rootRank)
         {

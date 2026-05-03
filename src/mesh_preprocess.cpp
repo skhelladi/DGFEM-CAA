@@ -71,6 +71,30 @@ int main(int argc, char **argv)
 {
     Parallel::init(&argc, &argv);
 
+    std::ofstream mpiNullStream;
+    std::streambuf *savedCoutBuf = nullptr;
+    std::streambuf *savedCerrBuf = nullptr;
+    std::streambuf *savedClogBuf = nullptr;
+    const bool mpiVerboseAllRanks = (std::getenv("DG_MPI_VERBOSE_ALL_RANKS") != nullptr);
+    if (Parallel::size() > 1 && !Parallel::isRoot() && !mpiVerboseAllRanks)
+    {
+        mpiNullStream.open("/dev/null");
+        if (mpiNullStream.is_open())
+        {
+            savedCoutBuf = std::cout.rdbuf();
+            savedCerrBuf = std::cerr.rdbuf();
+            savedClogBuf = std::clog.rdbuf();
+            std::cout.rdbuf(mpiNullStream.rdbuf());
+            std::cerr.rdbuf(mpiNullStream.rdbuf());
+            std::clog.rdbuf(mpiNullStream.rdbuf());
+        }
+    }
+    else if (Parallel::isRoot())
+    {
+        std::cout.setf(std::ios::unitbuf);
+        std::cerr.setf(std::ios::unitbuf);
+    }
+
     if (argc < 4 || argc > 6)
     {
         Parallel::finalize();
@@ -88,7 +112,7 @@ int main(int argc, char **argv)
     }
 
     gmsh::initialize();
-    gmsh::option::setNumber("General.Terminal", 1.0);
+    gmsh::option::setNumber("General.Terminal", (Parallel::isRoot() || mpiVerboseAllRanks) ? 1.0 : 0.0);
 
     Config config;
     if (fileExtension(configName) == "conf")
@@ -159,6 +183,13 @@ int main(int argc, char **argv)
     }
 
     writeJsonFile(outputDir / "manifest.json", manifest);
+
+    if (savedCoutBuf)
+        std::cout.rdbuf(savedCoutBuf);
+    if (savedCerrBuf)
+        std::cerr.rdbuf(savedCerrBuf);
+    if (savedClogBuf)
+        std::clog.rdbuf(savedClogBuf);
 
     gmsh::finalize();
     Parallel::finalize();

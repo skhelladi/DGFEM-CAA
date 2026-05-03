@@ -66,9 +66,24 @@ void init(int* argc, char*** argv) {
 }
 
 void finalize() { MPI_Finalize(); }
-int  rank()     { return _rank; }
-int  size()     { return _size; }
-bool isRoot()   { return _rank == 0; }
+int  rank()
+{
+    const int launcherSize = detectLauncherSize();
+    const int launcherRank = detectLauncherRank();
+    if (launcherSize > 1 && launcherRank >= 0 && launcherRank < launcherSize)
+        return launcherRank;
+    return _rank;
+}
+
+int  size()
+{
+    const int launcherSize = detectLauncherSize();
+    if (launcherSize > _size)
+        return launcherSize;
+    return _size;
+}
+
+bool isRoot()   { return rank() == 0; }
 void barrier()  { MPI_Barrier(_comm); }
 MPI_Comm comm() { return _comm; }
 

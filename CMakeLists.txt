@@ -1,6 +1,8 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 PROJECT(DGalerkin VERSION 1.3.6)
 
+INCLUDE(CTest)
+
 # put all generated files in a single folder (required in windows for exe linked to dlls)
 SET(LIBRARY_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin CACHE PATH "")
 SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin CACHE PATH "")
@@ -24,7 +26,7 @@ ELSEIF(CMAKE_CXX_COMPILER_ID MATCHES MSVC)
 ENDIF()
 
 # MPI (optional) — enable with -DDG_USE_MPI=ON
-OPTION(DG_USE_MPI "Enable MPI parallelization" OFF)
+OPTION(DG_USE_MPI "Enable MPI parallelization" ON)
 IF(DG_USE_MPI)
     FIND_PACKAGE(MPI REQUIRED)
     IF(MPI_CXX_FOUND)

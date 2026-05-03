@@ -8,6 +8,9 @@ SetFactory("OpenCASCADE");
 
 L = 100.0;   // domain side [m]
 h = 5.0;     // mesh element size [m]
+p = 1;       // spatial order (1: linear, 2: quadratic, ...)
+
+Mesh.ElementOrder = p;  // apply spatial order to mesh elements
 
 Rectangle(1) = {0, 0, 0, L, L, 0};
 

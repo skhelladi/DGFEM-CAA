@@ -8,6 +8,8 @@ SetFactory("OpenCASCADE");
 
 L = 100.0;   // domain side [m]
 N = 50;       // number of divisions per edge
+p = 1;       // spatial order (1: linear, 2: quadratic, ...)
+
 
 Box(1) = {0, 0, 0, L, L, L};
 
@@ -15,6 +17,8 @@ Box(1) = {0, 0, 0, L, L, L};
 // to avoid the background-mesh subdivision that corrupts Transfinite Volume.
 Mesh.Algorithm   = 10;   // Frontal-Delaunay (no QuadQuasiStructured)
 Mesh.Algorithm3D = 4;   // Frontal 3D
+Mesh.ElementOrder = p;  // apply spatial order to mesh elements
+
 
 // N divisions per edge
 Transfinite Curve{:} = N + 1;
