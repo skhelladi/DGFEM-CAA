@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <fstream>
 #include <gmsh.h>
 #include <iostream>
@@ -9,6 +10,37 @@
 #include <utils.h>
 
 #include "configParser.h"
+#include "MeshWorkflow.h"
+#include "Profiling.h"
+
+namespace
+{
+    bool isBoundaryTypeValue(const std::string &value)
+    {
+        return value == "Absorbing" || value == "Reflecting";
+    }
+
+    bool isReservedConfigKey(const std::string &key)
+    {
+        return key == "meshFileName" ||
+               key == "partitionManifestFile" ||
+               key == "partitionPackageFile" ||
+               key == "partitionMode" ||
+               key == "partitionCommand" ||
+               key == "timeStart" ||
+               key == "timeEnd" ||
+               key == "timeStep" ||
+               key == "timeRate" ||
+               key == "elementType" ||
+               key == "timeIntMethod" ||
+               key == "numThreads" ||
+               key == "v0_x" ||
+               key == "v0_y" ||
+               key == "v0_z" ||
+               key == "rho0" ||
+               key == "c0";
+    }
+}
 
 /**
  * Parse et load config file.
@@ -32,11 +64,13 @@ namespace config
 
     Config parseConfig(std::string name)
     {
+        profiling::CsvProfiler profiler("config_text", profiling::phasesEnabled("DG_PROFILE_CONFIG"));
         Config config;
 
         std::ifstream cFile(name);
         if (cFile.is_open())
         {
+            auto pt = profiler.tic();
             std::string line;
             std::map<std::string, std::string> configMap;
             while (getline(cFile, line))
@@ -50,7 +84,18 @@ namespace config
                 auto value = line.substr(delimiterPos + 1);
                 configMap[name] = value;
             }
+            profiler.add("read_file", pt);
+
+            pt = profiler.tic();
             config.meshFileName = configMap["meshFileName"];
+            if (configMap.count("partitionManifestFile"))
+                config.partitionManifestFile = configMap["partitionManifestFile"];
+            if (configMap.count("partitionPackageFile"))
+                config.partitionPackageFile = configMap["partitionPackageFile"];
+            if (configMap.count("partitionMode"))
+                config.partitionMode = configMap["partitionMode"];
+            if (configMap.count("partitionCommand"))
+                config.partitionCommand = configMap["partitionCommand"];
             config.timeStart = std::stod(configMap["timeStart"]);
             config.timeEnd = std::stod(configMap["timeEnd"]);
             config.timeStep = std::stod(configMap["timeStep"]);
@@ -188,39 +233,23 @@ namespace config
                     std::vector<double> init1 = {0, x, y, z, size, amp};
                     config.initConditions.push_back(init1);
                 }
+                else if (!isReservedConfigKey(key) && isBoundaryTypeValue(iter->second))
+                {
+                    config.pendingPhysBCs.push_back({key, iter->second, 0.0});
+                }
             }
+            profiler.add("decode_config", pt);
 
-            std::string physName;
-            std::ifstream mFile(config.meshFileName);
-            if (mFile.is_open())
+            pt = profiler.tic();
+            try
             {
-                gmsh::open(config.meshFileName);
+                meshworkflow::assertMeshFileReadable(config.meshFileName);
             }
-            else
+            catch (const std::exception &e)
             {
-                std::string message = "Mesh file '"+config.meshFileName+"' not found or corrupted";
-                Fatal_Error(message.c_str())
+                Fatal_Error(e.what())
             }
-            mFile.close();
-            gmsh::vectorpair m_physicalDimTags;
-            int bcDim = gmsh::model::getDimension() - 1;
-            gmsh::model::getPhysicalGroups(m_physicalDimTags, bcDim);
-            for (int p = 0; p < m_physicalDimTags.size(); ++p)
-            {
-                gmsh::model::getPhysicalName(m_physicalDimTags[p].first, m_physicalDimTags[p].second, physName);
-                if (configMap[physName].find("Absorbing") == 0)
-                {
-                    config.physBCs[m_physicalDimTags[p].second] = std::make_pair("Absorbing", 0);
-                }
-                else if (configMap[physName].find("Reflecting") == 0)
-                {
-                    config.physBCs[m_physicalDimTags[p].second] = std::make_pair("Reflecting", 0);
-                }
-                else
-                {
-                    gmsh::logger::write("Not specified or supported boundary conditions.");
-                }
-            }
+            profiler.add("mesh_file_check", pt);
         }
         else
         {
@@ -238,10 +267,17 @@ namespace config
         gmsh::logger::write("Mesh file: " + config.meshFileName);
         gmsh::logger::write("Solver: " + config.timeIntMethod);
 
+        profiler.metric("num_sources", static_cast<double>(config.sources.size()));
+        profiler.metric("num_observers", static_cast<double>(config.observers.size()));
+        profiler.metric("num_initial_conditions", static_cast<double>(config.initConditions.size()));
+        profiler.metric("num_boundary_conditions", static_cast<double>(config.pendingPhysBCs.size()));
+        profiler.emit();
+
         return config;
     }
     Config parseJSON(std::string name)
     {
+        profiling::CsvProfiler profiler("config_json", profiling::phasesEnabled("DG_PROFILE_CONFIG"));
 
         Config config;
 
@@ -250,46 +286,55 @@ namespace config
         if (cFile.is_open())
         {
             // mesh
+            auto pt = profiler.tic();
             cFile >> config.jsonData;
-            config.meshFileName = config.jsonData["mesh"]["File"];
-            int nbBC = config.jsonData["mesh"]["BC"]["number"];
-            std::string physName;
-            std::ifstream mFile(config.meshFileName);
-            if (mFile.is_open())
+            profiler.add("read_file", pt);
+
+            pt = profiler.tic();
+            const auto &meshConfig = config.jsonData["mesh"];
+            config.meshFileName = meshConfig["File"];
+            if (meshConfig.contains("partitionManifest"))
+                config.partitionManifestFile = meshConfig["partitionManifest"];
+            else if (meshConfig.contains("PartitionManifest"))
+                config.partitionManifestFile = meshConfig["PartitionManifest"];
+
+            if (meshConfig.contains("partitionPackage"))
+                config.partitionPackageFile = meshConfig["partitionPackage"];
+            else if (meshConfig.contains("PartitionPackage"))
+                config.partitionPackageFile = meshConfig["PartitionPackage"];
+
+            if (meshConfig.contains("partitionMode"))
+                config.partitionMode = meshConfig["partitionMode"];
+            else if (meshConfig.contains("PartitionMode"))
+                config.partitionMode = meshConfig["PartitionMode"];
+
+            if (meshConfig.contains("partitionCommand"))
+                config.partitionCommand = meshConfig["partitionCommand"];
+            else if (meshConfig.contains("PartitionCommand"))
+                config.partitionCommand = meshConfig["PartitionCommand"];
+
+            int nbBC = meshConfig["BC"]["number"];
+            for (int p = 0; p < nbBC; ++p)
             {
-                gmsh::open(config.meshFileName);
+                const std::string boundaryKey = "boundary" + std::to_string(p + 1);
+                config.pendingPhysBCs.push_back({
+                    meshConfig["BC"][boundaryKey]["name"],
+                    meshConfig["BC"][boundaryKey]["type"],
+                    0.0});
             }
-            else
+            try
             {
-                std::string message = "Mesh file '"+config.meshFileName+"' not found or corrupted";
-                Fatal_Error(message.c_str())
+                meshworkflow::assertMeshFileReadable(config.meshFileName);
             }
-            mFile.close();
-            gmsh::vectorpair m_physicalDimTags;
-            int bcDim = gmsh::model::getDimension() - 1;
-            gmsh::model::getPhysicalGroups(m_physicalDimTags, bcDim);
-            for (int p = 0; p < m_physicalDimTags.size(); ++p)
+            catch (const std::exception &e)
             {
-                gmsh::model::getPhysicalName(m_physicalDimTags[p].first, m_physicalDimTags[p].second, physName);
-                if (physName == config.jsonData["mesh"]["BC"]["boundary" + std::to_string(p + 1)]["name"])
-                {
-                    if (config.jsonData["mesh"]["BC"]["boundary" + std::to_string(p + 1)]["type"] == "Absorbing")
-                        config.physBCs[m_physicalDimTags[p].second] = std::make_pair("Absorbing", 0);
-                    else if (config.jsonData["mesh"]["BC"]["boundary" + std::to_string(p + 1)]["type"] == "Reflecting")
-                        config.physBCs[m_physicalDimTags[p].second] = std::make_pair("Reflecting", 0);
-                    else
-                    {
-                        gmsh::logger::write("Not specified or supported boundary conditions.");
-                    }
-                }
-                else
-                {
-                    gmsh::logger::write("Not specified or supported boundary conditions.");
-                }
+                Fatal_Error(e.what())
             }
-            screen_display::write_string("Mesh loaded", GREEN);
+            profiler.add("mesh_decode", pt);
+            screen_display::write_string("Mesh file queued", GREEN);
             // solver
 
+            pt = profiler.tic();
             config.timeStart = config.jsonData["solver"]["time"]["start"];
             config.timeEnd = config.jsonData["solver"]["time"]["end"];
             config.timeStep = config.jsonData["solver"]["time"]["step"];
@@ -298,8 +343,11 @@ namespace config
             config.timeIntMethod = config.jsonData["solver"]["timeIntMethod"];
             config.numThreads = config.jsonData["solver"]["numThreads"];
             config.numThreads = (config.numThreads == 1) ? 0 : config.numThreads;
+            profiler.add("solver_parameters", pt);
             screen_display::write_string("Solver parameters loaded", GREEN);
             // initial conditions
+
+            pt = profiler.tic();
             config.v0[0] = config.jsonData["initialization"]["meanFlow"]["vx"];
             config.v0[1] = config.jsonData["initialization"]["meanFlow"]["vy"];
             config.v0[2] = config.jsonData["initialization"]["meanFlow"]["vz"];
@@ -322,8 +370,11 @@ namespace config
                 std::vector<double> init1 = {double(index), x, y, z, size, amp};
                 config.initConditions.push_back(init1);
             }
+            profiler.add("initial_conditions", pt);
             screen_display::write_string("Initial conditions loaded", GREEN);
             // observers
+
+            pt = profiler.tic();
             int nbObs = config.jsonData["observers"]["number"];
             for (int i = 0; i < nbObs; i++)
             {
@@ -334,9 +385,12 @@ namespace config
                 std::vector<double> obs = {x, y, z, size};
                 config.observers.push_back(obs);
             }
+            profiler.add("observers", pt);
             screen_display::write_string("Observers coordinates loaded", GREEN);
 
             // sources
+
+            pt = profiler.tic();
             int nbSrc = config.jsonData["sources"]["number"];
             for (int i = 0; i < nbSrc; i++)
             {
@@ -428,6 +482,7 @@ namespace config
                     }
                 }
             }
+            profiler.add("sources", pt);
             screen_display::write_string("Sources loaded", GREEN);
         }
         else
@@ -444,7 +499,18 @@ namespace config
         gmsh::logger::write("Mean density: " + std::to_string(config.rho0));
         gmsh::logger::write("Speed of sound: " + std::to_string(config.c0));
         gmsh::logger::write("Mesh file: " + config.meshFileName);
+        if (!config.partitionManifestFile.empty())
+            gmsh::logger::write("Partition manifest: " + config.partitionManifestFile);
+        if (!config.partitionPackageFile.empty())
+            gmsh::logger::write("Partition package: " + config.partitionPackageFile);
+        gmsh::logger::write("Partition mode: " + config.partitionMode);
         gmsh::logger::write("Solver: " + config.timeIntMethod);
+
+        profiler.metric("num_sources", static_cast<double>(config.sources.size()));
+        profiler.metric("num_observers", static_cast<double>(config.observers.size()));
+        profiler.metric("num_initial_conditions", static_cast<double>(config.initConditions.size()));
+        profiler.metric("num_boundary_conditions", static_cast<double>(config.pendingPhysBCs.size()));
+        profiler.emit();
 
         return config;
     }

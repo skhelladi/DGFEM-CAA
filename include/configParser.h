@@ -66,11 +66,22 @@ public:
 //     std::vector<double> observer;
 // };
 
+struct BoundaryConditionSpec
+{
+    std::string physicalName;
+    std::string type;
+    double value = 0.0;
+};
+
 struct Config
 {
     ordered_json jsonData;
     
     std::string meshFileName;
+    std::string partitionManifestFile;
+    std::string partitionPackageFile;
+    std::string partitionMode = "gmsh";
+    std::string partitionCommand;
     
     // Initial, final time and time step(t>0)
     double timeStart = 0;
@@ -88,6 +99,7 @@ struct Config
     // key : physical group Tag
     // value : tuple<BCType, BCValue>
     std::map<int, std::pair<std::string, double>> physBCs;
+    std::vector<BoundaryConditionSpec> pendingPhysBCs;
 
     // Mean flow parameters
     std::vector<double> v0 = {0, 0, 0};

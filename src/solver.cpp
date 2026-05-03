@@ -8,6 +8,7 @@
 
 #include "Mesh.h"
 #include "Parallel.h"
+#include "Profiling.h"
 #include "configParser.h"
 
 namespace solver
@@ -25,6 +26,36 @@ namespace solver
     std::vector<std::vector<std::vector<double>>> Flux;
 
     std::vector<std::vector<float>> data4wave;
+
+    using prof_clk = profiling::CsvProfiler::Clock;
+
+    struct SolverStageTimers
+    {
+        long long precomputeMassMatrixUs = 0;
+        long long sourceLocatorUs = 0;
+        long long observerLocatorUs = 0;
+        long long initialHaloUs = 0;
+        long long outputUs = 0;
+        long long sourceUpdateUs = 0;
+        long long updateFluxUs = 0;
+        long long precomputeFluxUs = 0;
+        long long numStepKernelUs = 0;
+        long long haloUs = 0;
+        long long residualAssemblyUs = 0;
+        long long reductionUs = 0;
+        long long observerSamplingUs = 0;
+        long long finalObserverExportUs = 0;
+    };
+
+    inline prof_clk::time_point tic()
+    {
+        return prof_clk::now();
+    }
+
+    inline long long us(prof_clk::time_point t0)
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(prof_clk::now() - t0).count();
+    }
 
     int localElBegin(const Mesh &mesh)
     {
@@ -44,6 +75,31 @@ namespace solver
         return mesh.getElNum();
     }
 
+    void emitSolverProfile(const std::string &name, const SolverStageTimers &timers,
+                           const Mesh &mesh, long long stepsCompleted, long long totalUs)
+    {
+        profiling::CsvProfiler profiler(name, true);
+        profiler.addUs("precomputeMassMatrix", timers.precomputeMassMatrixUs);
+        profiler.addUs("sourceLocator", timers.sourceLocatorUs);
+        profiler.addUs("observerLocator", timers.observerLocatorUs);
+        profiler.addUs("initialHalo", timers.initialHaloUs);
+        profiler.addUs("output", timers.outputUs);
+        profiler.addUs("sourceUpdate", timers.sourceUpdateUs);
+        profiler.addUs("updateFlux", timers.updateFluxUs);
+        profiler.addUs("precomputeFlux", timers.precomputeFluxUs);
+        profiler.addUs("numStepKernel", timers.numStepKernelUs);
+        profiler.addUs("haloExchange", timers.haloUs);
+        profiler.addUs("residualAssembly", timers.residualAssemblyUs);
+        profiler.addUs("reductions", timers.reductionUs);
+        profiler.addUs("observerSampling", timers.observerSamplingUs);
+        profiler.addUs("finalObserverExport", timers.finalObserverExportUs);
+        profiler.metric("steps", static_cast<double>(stepsCompleted));
+        profiler.metric("stored_elements", static_cast<double>(mesh.getElNum()));
+        profiler.metric("owned_elements", static_cast<double>(localElEnd(mesh) - localElBegin(mesh)));
+        profiler.metric("stored_nodes", static_cast<double>(mesh.getNumNodes()));
+        profiler.emit(totalUs);
+    }
+
     /**
      * Perform a numerical step: u[t+1] = dt*M^-1*(S[u[t]]-F[u[t]]) + beta*u[t]
      * for all elements in mesh object.
@@ -55,24 +111,51 @@ namespace solver
      * @param beta double coefficient
      */
     void numStep(Mesh &mesh, Config config, std::vector<std::vector<double>> &u,
-                 std::vector<std::vector<std::vector<double>>> &Flux, double beta)
+                 std::vector<std::vector<std::vector<double>>> &Flux, double beta,
+                 SolverStageTimers *timers = nullptr)
     {
         const int elBegin = localElBegin(mesh);
         const int elEnd = localElEnd(mesh);
 
         for (int eq = 0; eq < 4; ++eq)
         {
-            mesh.precomputeFlux(u[eq], Flux[eq], eq);
-
-#pragma omp parallel for schedule(static) firstprivate(elFlux, elStiffvector) num_threads(config.numThreads)
-            for (int el = elBegin; el < elEnd; ++el)
+            if (timers)
             {
+                auto precomputeStart = tic();
+                mesh.precomputeFlux(u[eq], Flux[eq], eq);
+                timers->precomputeFluxUs += us(precomputeStart);
+            }
+            else
+            {
+                mesh.precomputeFlux(u[eq], Flux[eq], eq);
+            }
 
-                mesh.getElFlux(el, elFlux.data());
-                mesh.getElStiffVector(el, Flux[eq], u[eq], elStiffvector.data());
-                eigen::minus(elStiffvector.data(), elFlux.data(), elNumNodes);
-                eigen::linEq(&mesh.elMassMatrix(el), &elStiffvector[0], &u[eq][el * elNumNodes],
-                             config.timeStep, beta, elNumNodes);
+            if (timers)
+            {
+                auto kernelStart = tic();
+#pragma omp parallel for schedule(static) firstprivate(elFlux, elStiffvector) num_threads(config.numThreads)
+                for (int el = elBegin; el < elEnd; ++el)
+                {
+                    mesh.getElFlux(el, elFlux.data());
+                    mesh.getElStiffVector(el, Flux[eq], u[eq], elStiffvector.data());
+                    eigen::minus(elStiffvector.data(), elFlux.data(), elNumNodes);
+                    eigen::linEq(&mesh.elMassMatrix(el), &elStiffvector[0], &u[eq][el * elNumNodes],
+                                 config.timeStep, beta, elNumNodes);
+                }
+                timers->numStepKernelUs += us(kernelStart);
+            }
+            else
+            {
+#pragma omp parallel for schedule(static) firstprivate(elFlux, elStiffvector) num_threads(config.numThreads)
+                for (int el = elBegin; el < elEnd; ++el)
+                {
+
+                    mesh.getElFlux(el, elFlux.data());
+                    mesh.getElStiffVector(el, Flux[eq], u[eq], elStiffvector.data());
+                    eigen::minus(elStiffvector.data(), elFlux.data(), elNumNodes);
+                    eigen::linEq(&mesh.elMassMatrix(el), &elStiffvector[0], &u[eq][el * elNumNodes],
+                                 config.timeStep, beta, elNumNodes);
+                }
             }
         }
     }
@@ -87,8 +170,12 @@ namespace solver
     void forwardEuler(std::vector<std::vector<double>> &u, Mesh &mesh, Config config)
     {
         const bool rootRank = Parallel::isRoot();
+        const bool profileSolver = profiling::phasesEnabled("DG_PROFILE_SOLVER");
         const int elBegin = localElBegin(mesh);
         const int elEnd = localElEnd(mesh);
+        SolverStageTimers timers;
+        long long stepsCompleted = 0;
+        const auto solverProfileStart = tic();
 
         /** Memory allocation */
         elNumNodes = mesh.getElNumNodes();
@@ -110,9 +197,19 @@ namespace solver
         std::vector<std::vector<double>> g_v(mesh.getElNum(), std::vector<double>(3 * elNumNodes));
 
         /** Precomputation */
-        mesh.precomputeMassMatrix();
+        if (profileSolver)
+        {
+            auto tt = tic();
+            mesh.precomputeMassMatrix();
+            timers.precomputeMassMatrixUs += us(tt);
+        }
+        else
+        {
+            mesh.precomputeMassMatrix();
+        }
 
         /** Source */
+        auto tt = tic();
         std::vector<std::vector<int>> srcIndices;
         for (int i = 0; i < config.sources.size(); ++i)
         {
@@ -132,8 +229,11 @@ namespace solver
             }
             srcIndices.push_back(indice);
         }
+        if (profileSolver)
+            timers.sourceLocatorUs += us(tt);
 
         /** Observer */
+        tt = tic();
         std::vector<std::vector<int>> obsIndices;
         std::vector<std::vector<double>> obsPtDistance;
         for (int i = 0; i < config.observers.size(); ++i)
@@ -157,6 +257,8 @@ namespace solver
             obsIndices.push_back(indice);
             obsPtDistance.push_back(dist);
         }
+        if (profileSolver)
+            timers.observerLocatorUs += us(tt);
 
         /**
          * Main Loop : Time iteration
@@ -181,12 +283,22 @@ namespace solver
             }
         }
 
-        mesh.haloExchange(u);
+        if (profileSolver)
+        {
+            tt = tic();
+            mesh.haloExchange(u);
+            timers.initialHaloUs += us(tt);
+        }
+        else
+        {
+            mesh.haloExchange(u);
+        }
 
         auto start = std::chrono::system_clock::now();
         for (double t = config.timeStart, step = 0, tDisplay = 0; t <= config.timeEnd;
              t += config.timeStep, tDisplay += config.timeStep, ++step)
         {
+            ++stepsCompleted;
 
             auto start_time = std::chrono::system_clock::now();
             std::vector<double> residual(5, 0.0);
@@ -197,6 +309,8 @@ namespace solver
             if (tDisplay >= config.timeRate || step == 0)
             {
                 tDisplay = 0;
+                if (profileSolver)
+                    tt = tic();
 
 /** [1] Copy solution to match GMSH format */
 #pragma omp parallel for schedule(static) num_threads(config.numThreads)
@@ -238,12 +352,17 @@ namespace solver
                     std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
                     mesh.writeVTUb(vtu_filename, u);
                 }
+
+                if (profileSolver)
+                    timers.outputUs += us(tt);
             }
 
             /**
              * Update Source
              */
 
+            if (profileSolver)
+                tt = tic();
             for (int src = 0; src < config.sources.size(); ++src)
             {
                 if (config.sources[src].formula == "" && config.sources[src].data.empty())
@@ -272,17 +391,41 @@ namespace solver
                     }
                 }
             }
+            if (profileSolver)
+                timers.sourceUpdateUs += us(tt);
 
             /**
              * First Order Euler
              */
-            mesh.updateFlux(u, Flux, config.v0, config.c0, config.rho0);
-            numStep(mesh, config, u, Flux, 1);
-            mesh.haloExchange(u);
+            if (profileSolver)
+            {
+                tt = tic();
+                mesh.updateFlux(u, Flux, config.v0, config.c0, config.rho0);
+                timers.updateFluxUs += us(tt);
+            }
+            else
+            {
+                mesh.updateFlux(u, Flux, config.v0, config.c0, config.rho0);
+            }
+
+            numStep(mesh, config, u, Flux, 1, profileSolver ? &timers : nullptr);
+
+            if (profileSolver)
+            {
+                tt = tic();
+                mesh.haloExchange(u);
+                timers.haloUs += us(tt);
+            }
+            else
+            {
+                mesh.haloExchange(u);
+            }
 
             /**
              * Compute residuals
              */
+            if (profileSolver)
+                tt = tic();
 #pragma omp parallel for schedule(static) num_threads(config.numThreads)
             for (int el = elBegin; el < elEnd; ++el)
             {
@@ -301,7 +444,11 @@ namespace solver
                     residual[4] += pow(g_v[el][3 * n + 2] - u[3][elN], 2);
                 }
             }
+            if (profileSolver)
+                timers.residualAssemblyUs += us(tt);
 
+            if (profileSolver)
+                tt = tic();
             std::vector<double> residualGlobal(residual.size(), 0.0);
             Parallel::allReduce(residual.data(), residualGlobal.data(), static_cast<int>(residual.size()));
             residual.swap(residualGlobal);
@@ -311,6 +458,8 @@ namespace solver
             // partitioned mode (where mesh.getElNum() is local+halo, not global).
             int localDof  = (elEnd - elBegin) * mesh.getElNumNodes();
             int globalDof = Parallel::allReduceScalar<int>(localDof);
+            if (profileSolver)
+                timers.reductionUs += us(tt);
 
             auto end_time = std::chrono::system_clock::now();
             auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
@@ -333,6 +482,8 @@ namespace solver
              * Inverse-distance interpolation. Each rank accumulates local
              * contributions; the global sum is reduced to root for output.
              */
+            if (profileSolver)
+                tt = tic();
             for (int obs = 0; obs < config.observers.size(); ++obs)
             {
                 double localPVW[5] = {0, 0, 0, 0, 0}; // p, vx, vy, vz, w_sum
@@ -361,9 +512,13 @@ namespace solver
                     obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
                 }
             }
+            if (profileSolver)
+                timers.observerSamplingUs += us(tt);
         }
         if (rootRank)
         {
+            if (profileSolver)
+                tt = tic();
             for (int obs = 0; obs < config.observers.size(); ++obs)
             {
                 io::writeWave(data4wave[obs], "results/observer_" + std::to_string(obs + 1) + ".wav", 1.0 / config.timeStep, 16, 1, 1);
@@ -373,7 +528,12 @@ namespace solver
             outfile.close();
             for (int obs = 0; obs < config.observers.size(); ++obs)
                 obs_outfile[obs].close();
+            if (profileSolver)
+                timers.finalObserverExportUs += us(tt);
         }
+
+        if (profileSolver)
+            emitSolverProfile("solver_euler", timers, mesh, stepsCompleted, us(solverProfileStart));
     }
 
     /**
@@ -386,8 +546,12 @@ namespace solver
     void rungeKutta(std::vector<std::vector<double>> &u, Mesh &mesh, Config config)
     {
         const bool rootRank = Parallel::isRoot();
+        const bool profileSolver = profiling::phasesEnabled("DG_PROFILE_SOLVER");
         const int elBegin = localElBegin(mesh);
         const int elEnd = localElEnd(mesh);
+        SolverStageTimers timers;
+        long long stepsCompleted = 0;
+        const auto solverProfileStart = tic();
 
         /** Memory allocation */
         elNumNodes = mesh.getElNumNodes();
@@ -412,11 +576,21 @@ namespace solver
         /** Precomputation (constants over time) */
         if (rootRank)
             screen_display::write_string("\t>>> Precomputation", BLUE);
-        mesh.precomputeMassMatrix();
+        if (profileSolver)
+        {
+            auto tt = tic();
+            mesh.precomputeMassMatrix();
+            timers.precomputeMassMatrixUs += us(tt);
+        }
+        else
+        {
+            mesh.precomputeMassMatrix();
+        }
         if (rootRank)
             screen_display::write_string("\t>>> precomputeMassMatrix", BLUE);
 
         /** Source */
+        auto tt = tic();
         std::vector<std::vector<int>> srcIndices;
         for (int i = 0; i < config.sources.size(); ++i)
         {
@@ -436,8 +610,11 @@ namespace solver
             }
             srcIndices.push_back(indice);
         }
+        if (profileSolver)
+            timers.sourceLocatorUs += us(tt);
 
         /** Observer */
+        tt = tic();
         std::vector<std::vector<int>> obsIndices;
         std::vector<std::vector<double>> obsPtDistance;
         for (int i = 0; i < config.observers.size(); ++i)
@@ -461,6 +638,8 @@ namespace solver
             obsIndices.push_back(indice);
             obsPtDistance.push_back(dist);
         }
+        if (profileSolver)
+            timers.observerLocatorUs += us(tt);
 
         // for (int i = 0; i < obsIndices.size(); i++)
         // {
@@ -496,19 +675,22 @@ namespace solver
             }
         }
 
-        mesh.haloExchange(u);
-
-        // Cumulative profiling counters (microseconds), printed at the end.
-        long long t_halo_us = 0;
-        long long t_updFlux_us = 0;
-        long long t_numStep_us = 0;
-        long long t_residual_us = 0;
-        long long t_obs_io_us = 0;
+        if (profileSolver)
+        {
+            tt = tic();
+            mesh.haloExchange(u);
+            timers.initialHaloUs += us(tt);
+        }
+        else
+        {
+            mesh.haloExchange(u);
+        }
 
         auto start = std::chrono::system_clock::now();
         for (double t = config.timeStart, step = 0, tDisplay = 0; t <= config.timeEnd;
              t += config.timeStep, tDisplay += config.timeStep, ++step)
         {
+            ++stepsCompleted;
             auto start_time = std::chrono::system_clock::now();
             std::vector<double> residual(5, 0.0);
             /**
@@ -517,6 +699,8 @@ namespace solver
             if (tDisplay >= config.timeRate || step == 0)
             {
                 tDisplay = 0;
+                if (profileSolver)
+                    tt = tic();
 
 /** [1] Copy solution to match GMSH format */
 // #pragma omp parallel for
@@ -562,9 +746,14 @@ namespace solver
                     std::string vtu_filename = "results/result" + std::to_string((int)step) + ".vtu";
                     mesh.writeVTUb(vtu_filename, u);
                 }
+
+                if (profileSolver)
+                    timers.outputUs += us(tt);
             }
 
             /** Source */
+            if (profileSolver)
+                tt = tic();
             for (int src = 0; src < config.sources.size(); ++src)
             {
                 if (config.sources[src].formula == "" && config.sources[src].data.empty())
@@ -593,55 +782,63 @@ namespace solver
                     }
                 }
             }
+            if (profileSolver)
+                timers.sourceUpdateUs += us(tt);
 
             /**
              * Fourth order Runge-Kutta algorithm
              */
-            using clk = std::chrono::system_clock;
-            auto tic = [](){ return clk::now(); };
-            auto us  = [](clk::time_point t0){
-                return std::chrono::duration_cast<std::chrono::microseconds>(clk::now() - t0).count();
-            };
-
             k1 = k2 = k3 = k4 = u;
-            auto tt = tic();
+            tt = tic();
             /** [1] Step R-K */
             mesh.updateFlux(k1, Flux, config.v0, config.c0, config.rho0);
-            t_updFlux_us += us(tt); tt = tic();
-            numStep(mesh, config, k1, Flux, 0);
-            t_numStep_us += us(tt); tt = tic();
+            if (profileSolver)
+                timers.updateFluxUs += us(tt);
+            tt = tic();
+            numStep(mesh, config, k1, Flux, 0, profileSolver ? &timers : nullptr);
+            tt = tic();
             mesh.haloExchange(k1);
-            t_halo_us += us(tt);
+            if (profileSolver)
+                timers.haloUs += us(tt);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k2[eq].data(), k1[eq].data(), 0.5, numNodes);
             tt = tic();
             /** [2] Step R-K */
             mesh.updateFlux(k2, Flux, config.v0, config.c0, config.rho0);
-            t_updFlux_us += us(tt); tt = tic();
-            numStep(mesh, config, k2, Flux, 0);
-            t_numStep_us += us(tt); tt = tic();
+            if (profileSolver)
+                timers.updateFluxUs += us(tt);
+            tt = tic();
+            numStep(mesh, config, k2, Flux, 0, profileSolver ? &timers : nullptr);
+            tt = tic();
             mesh.haloExchange(k2);
-            t_halo_us += us(tt);
+            if (profileSolver)
+                timers.haloUs += us(tt);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k3[eq].data(), k2[eq].data(), 0.5, numNodes);
             tt = tic();
             /** [3] Step R-K */
             mesh.updateFlux(k3, Flux, config.v0, config.c0, config.rho0);
-            t_updFlux_us += us(tt); tt = tic();
-            numStep(mesh, config, k3, Flux, 0);
-            t_numStep_us += us(tt); tt = tic();
+            if (profileSolver)
+                timers.updateFluxUs += us(tt);
+            tt = tic();
+            numStep(mesh, config, k3, Flux, 0, profileSolver ? &timers : nullptr);
+            tt = tic();
             mesh.haloExchange(k3);
-            t_halo_us += us(tt);
+            if (profileSolver)
+                timers.haloUs += us(tt);
             for (int eq = 0; eq < u.size(); ++eq)
                 eigen::plusTimes(k4[eq].data(), k3[eq].data(), 1, numNodes);
             tt = tic();
             /** [4] Step R-K */
             mesh.updateFlux(k4, Flux, config.v0, config.c0, config.rho0);
-            t_updFlux_us += us(tt); tt = tic();
-            numStep(mesh, config, k4, Flux, 0);
-            t_numStep_us += us(tt); tt = tic();
+            if (profileSolver)
+                timers.updateFluxUs += us(tt);
+            tt = tic();
+            numStep(mesh, config, k4, Flux, 0, profileSolver ? &timers : nullptr);
+            tt = tic();
             mesh.haloExchange(k4);
-            t_halo_us += us(tt);
+            if (profileSolver)
+                timers.haloUs += us(tt);
             /** Concat results of R-K iterations */
             // #pragma omp parallel for
             for (int eq = 0; eq < u.size(); ++eq)
@@ -655,8 +852,11 @@ namespace solver
 
             tt = tic();
             mesh.haloExchange(u);
-            t_halo_us += us(tt);
+            if (profileSolver)
+                timers.haloUs += us(tt);
 
+            if (profileSolver)
+                tt = tic();
 #pragma omp parallel for schedule(static) num_threads(config.numThreads)
             for (int el = elBegin; el < elEnd; ++el)
             {
@@ -675,13 +875,19 @@ namespace solver
                     residual[4] += pow(g_v[el][3 * n + 2] - u[3][elN], 2);
                 }
             }
+            if (profileSolver)
+                timers.residualAssemblyUs += us(tt);
 
+            if (profileSolver)
+                tt = tic();
             std::vector<double> residualGlobal(residual.size(), 0.0);
             Parallel::allReduce(residual.data(), residualGlobal.data(), static_cast<int>(residual.size()));
             residual.swap(residualGlobal);
 
             int localDof  = (elEnd - elBegin) * mesh.getElNumNodes();
             int globalDof = Parallel::allReduceScalar<int>(localDof);
+            if (profileSolver)
+                timers.reductionUs += us(tt);
 
             auto end_time = std::chrono::system_clock::now();
             auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
@@ -703,6 +909,8 @@ namespace solver
              * Inverse-distance interpolation. Each rank accumulates local
              * contributions; the global sum is reduced to root for output.
              */
+            if (profileSolver)
+                tt = tic();
             for (int obs = 0; obs < config.observers.size(); ++obs)
             {
                 double localPVW[5] = {0, 0, 0, 0, 0}; // p, vx, vy, vz, w_sum
@@ -731,9 +939,13 @@ namespace solver
                     obs_outfile[obs] << t << ";" << rho << ";" << p << ";" << vx << ";" << vy << ";" << vz << std::endl;
                 }
             }
+            if (profileSolver)
+                timers.observerSamplingUs += us(tt);
         }
         if (rootRank)
         {
+            if (profileSolver)
+                tt = tic();
             for (int obs = 0; obs < config.observers.size(); ++obs)
             {
                 io::writeWave(data4wave[obs], "results/observer_" + std::to_string(obs + 1) + ".wav", 1.0 / config.timeStep, 16, 1, 1);
@@ -743,16 +955,11 @@ namespace solver
             outfile.close();
             for (int obs = 0; obs < config.observers.size(); ++obs)
                 obs_outfile[obs].close();
+            if (profileSolver)
+                timers.finalObserverExportUs += us(tt);
         }
 
-        // Profiling summary — printed by every rank so we can compare ranks.
-        long long t_total = t_halo_us + t_updFlux_us + t_numStep_us;
-        std::cout << "[MPI rank " << Parallel::rank() << "] RK4 hot-loop totals (s): "
-                  << "halo=" << t_halo_us / 1e6
-                  << " updFlux=" << t_updFlux_us / 1e6
-                  << " numStep=" << t_numStep_us / 1e6
-                  << " total=" << t_total / 1e6
-                  << " (halo share=" << (t_total > 0 ? 100.0 * t_halo_us / t_total : 0.0) << "%)"
-                  << std::endl;
+        if (profileSolver)
+            emitSolverProfile("solver_rk4", timers, mesh, stepsCompleted, us(solverProfileStart));
     }
 }

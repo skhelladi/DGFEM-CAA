@@ -18,6 +18,7 @@
 //! /////////
 
 #include "configParser.h"
+#include "MeshPartitioning.h"
 #include "utils.h"
 
 //! VTK headers
@@ -353,52 +354,6 @@ private:
     void buildLocalFaceList(); // populate m_localFaces (after connectivity)
 #endif
 };
-
-#ifdef DG_USE_MPI
-/**
- * Layout of a partitioned mesh as gmsh exposes it after `partition(N)`
- * with `Mesh.PartitionCreateGhostCells = 1`.
- *
- * For a given rank r (= gmsh partition r+1):
- *  - ownedEntities[3]   : 3D entity tags whose partitions == [r+1] AND
- *                          have NO ghosts (i.e. these are the local elements)
- *  - haloEntities[3]    : 3D entity tags whose partitions == [r+1] AND
- *                          DO have ghosts (these are the halo / ghost cells)
- *  - boundaryEntities[2]: 2D entity tags whose partitions == [r+1] (only)
- *                          → physical boundary faces of this rank
- *  - interfaceEntities[2]: map from neighbour rank (k) → list of 2D entity
- *                          tags whose partitions == sorted([r+1, k+1])
- *                          → faces shared between rank r and rank k
- *  - haloOwnerRank      : for each ghost element tag in haloEntities[3],
- *                          the gmsh partition tag of its owner (= remote rank +1).
- *                          Same length and order as the concatenation of
- *                          getElements()/getGhostElements() over haloEntities[3].
- *
- * This struct is the SOLE point that talks to the gmsh partition API.
- * Everything downstream (Mesh constructor) consumes this layout in
- * terms of gmsh element tags and entity tags.
- */
-struct PartitionLayout
-{
-    std::vector<int> ownedEntities3D;   // 3D entities of locally owned elements
-    std::vector<int> haloEntities3D;    // 3D entities of ghost elements
-    std::vector<int> boundaryEntities2D; // physical boundary faces (rank-only)
-
-    // interfaceEntitiesByRank[k] = list of 2D entity tags whose partitions
-    // are exactly {r+1, k+1}. Used to detect halo neighbours.
-    std::map<int, std::vector<int>> interfaceEntitiesByRank;
-};
-
-/**
- * Run gmsh::model::mesh::partition(N) (idempotent — re-using an
- * already-partitioned mesh is allowed) and classify the resulting
- * entities for the calling rank. Returns the layout.
- *
- * Pre: gmsh::open() has been called and the mesh is loaded.
- * Pre: Parallel::size() > 1 and Parallel::rank() is valid.
- */
-PartitionLayout buildPartitionLayout();
-#endif // DG_USE_MPI
 
 //! Tables operation functions
 

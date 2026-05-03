@@ -8,7 +8,9 @@
 #include <unordered_map>
 
 #include "Mesh.h"
+#include "MeshWorkflow.h"
 #include "Parallel.h"
+#include "Profiling.h"
 #include "configParser.h"
 #include "utils.h"
 
@@ -50,20 +52,52 @@ static void loadFaceNodesByPartition(const PartitionLayout &layout,
  */
 Mesh::Mesh(Config config) : config(config)
 {
-    // ----------------------------------------------------------------
-    // Phase 7 profiler — cumulative timing of major preprocessing blocks.
-    // Set DG_PROFILE_MESH=1 to enable; output is one CSV line per rank
-    // on stdout at end of constructor (ingestible by pandas/awk).
-    // ----------------------------------------------------------------
-    using prof_clk = std::chrono::steady_clock;
-    const bool profileMesh = (std::getenv("DG_PROFILE_MESH") != nullptr);
-    auto profTotalStart = prof_clk::now();
-    std::map<std::string, long long> profUs;
-    auto profMark = [&](const std::string &label, prof_clk::time_point t0) {
-        if (!profileMesh) return;
-        auto t1 = prof_clk::now();
-        profUs[label] += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    using prof_clk = profiling::CsvProfiler::Clock;
+    profiling::CsvProfiler profiler("mesh", profiling::phasesEnabled("DG_PROFILE_MESH"));
+    auto profMark = [&](const std::string &label, profiling::CsvProfiler::TimePoint t0) {
+        profiler.add(label, t0);
     };
+
+#ifdef DG_USE_MPI
+    bool usePartitionPackage = false;
+    PartitionPackageData partitionPackage;
+    PartitionLayout runtimePartitionLayout;
+    bool haveRuntimePartitionLayout = false;
+    if (Parallel::size() > 1 && (!config.partitionManifestFile.empty() || !config.partitionPackageFile.empty()))
+    {
+        auto packagePt = prof_clk::now();
+        partitionPackage = meshpartitioning::loadPartitionPackageForRank(config.partitionManifestFile,
+                                                                         config.partitionPackageFile,
+                                                                         Parallel::rank(),
+                                                                         Parallel::size());
+        config.meshFileName = partitionPackage.partitionedMeshFile;
+        config.partitionMode = partitionPackage.partitionMode;
+        if (!partitionPackage.resolvedBoundaryConditions.empty())
+            config.physBCs = partitionPackage.resolvedBoundaryConditions;
+        usePartitionPackage = true;
+        profMark("00a_load_partition_package", packagePt);
+    }
+
+    auto getRuntimePartitionLayout = [&]() -> const PartitionLayout & {
+        if (!haveRuntimePartitionLayout)
+        {
+            if (usePartitionPackage)
+                runtimePartitionLayout = partitionPackage.layout;
+            else
+                runtimePartitionLayout = meshpartitioning::buildLayoutForPartition(Parallel::rank(),
+                                                                                   Parallel::size(),
+                                                                                   true,
+                                                                                   config.partitionMode,
+                                                                                   config.partitionCommand);
+            haveRuntimePartitionLayout = true;
+        }
+        return runtimePartitionLayout;
+    };
+#endif
+
+    auto pt = prof_clk::now();
+    meshworkflow::reloadModel(config.meshFileName);
+    profMark("00_open_mesh_model", pt);
 
     /******************************
      *          Elements          *
@@ -82,7 +116,7 @@ Mesh::Mesh(Config config) : config(config)
     };
 
     auto start = std::chrono::system_clock::now();
-    auto pt = prof_clk::now();
+    pt = prof_clk::now();
     m_elDim = gmsh::model::getDimension();
     gmsh::model::mesh::getElementTypes(m_elType, m_elDim);
     int _numPrimaryNodes = 0;
@@ -115,7 +149,7 @@ Mesh::Mesh(Config config) : config(config)
     {
         pt = prof_clk::now();
         // Partitioned load: each rank only allocates [owned | halo].
-        PartitionLayout layout = buildPartitionLayout();
+        const PartitionLayout &layout = getRuntimePartitionLayout();
         profMark("03a_buildPartitionLayout", pt);
         pt = prof_clk::now();
         loadElementsByPartition(layout, m_elType[0], m_elParamCoord,
@@ -264,7 +298,7 @@ Mesh::Mesh(Config config) : config(config)
     {
         // Re-classify: we need the layout again to know which entities to walk.
         // (Cheap: it just queries gmsh, no re-partitioning.)
-        PartitionLayout layout = buildPartitionLayout();
+        const PartitionLayout &layout = getRuntimePartitionLayout();
         const int faceNumNodes = (m_fDim < 2) ? -1 : (hasQuadrilateralFaces ? 4 : 3);
         loadFaceNodesByPartition(layout, m_elType[0], faceNumNodes, m_elFNodeTags);
     }
@@ -572,7 +606,7 @@ Mesh::Mesh(Config config) : config(config)
 #ifdef DG_USE_MPI
     if (Parallel::size() > 1)
     {
-        PartitionLayout layout = buildPartitionLayout();
+        const PartitionLayout &layout = getRuntimePartitionLayout();
         loadBarycentersByPartition(layout, m_elType[0], m_elBarycenters);
     }
     else
@@ -709,6 +743,11 @@ Mesh::Mesh(Config config) : config(config)
      * Default  : Absorbing (!= 1 or 2)
      */
     m_fBC.resize(m_fNum);
+    pt = prof_clk::now();
+    if (config.physBCs.empty() && !config.pendingPhysBCs.empty())
+        config.physBCs = meshworkflow::resolvePhysicalBoundaryConditions(config.pendingPhysBCs, m_fDim);
+    profMark("14b_resolve_phys_bcs", pt);
+
     std::vector<size_t> nodeTags;
     std::vector<double> coord;
     for (auto const &physBC : config.physBCs)
@@ -834,33 +873,9 @@ Mesh::Mesh(Config config) : config(config)
     screen_display::write_value("Elapsed time:", elapsed.count() * 1.0e-6, "s", BLUE);
 
     // ----- Phase 7 profiler output -----
-    if (profileMesh)
-    {
-        long long totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                                prof_clk::now() - profTotalStart).count();
-        const int rank = Parallel::rank();
-        // CSV header (rank 0 only) for easy ingestion
-        if (rank == 0)
-        {
-            std::cerr << "PROF_CSV,rank,section,seconds,share_percent" << std::endl;
-        }
-        // Sum
-        long long sumUs = 0;
-        for (auto &kv : profUs) sumUs += kv.second;
-        for (auto &kv : profUs)
-        {
-            const double s     = kv.second / 1e6;
-            const double share = sumUs > 0 ? 100.0 * kv.second / sumUs : 0.0;
-            std::cerr << "PROF_CSV," << rank << "," << kv.first
-                      << "," << s << "," << share << std::endl;
-        }
-        std::cerr << "PROF_CSV," << rank << ",TOTAL," << totalUs / 1e6
-                  << ",100" << std::endl;
-        std::cerr << "PROF_CSV," << rank << ",num_elements,"
-                  << m_elNum << ",-1" << std::endl;
-        std::cerr << "PROF_CSV," << rank << ",num_faces,"
-                  << m_fNum << ",-1" << std::endl;
-    }
+    profiler.metric("num_elements", static_cast<double>(m_elNum));
+    profiler.metric("num_faces", static_cast<double>(m_fNum));
+    profiler.emit();
 }
 
 #ifdef DG_USE_MPI
@@ -1036,6 +1051,7 @@ static void loadElementsByPartition(const PartitionLayout &layout,
     jacobianDets.clear();
     intPtCoords.clear();
     haloOwnerRank.clear();
+    const int cellDim = gmsh::model::getDimension();
 
     auto loadEntity = [&](int dim, int entTag) -> std::size_t
     {
@@ -1058,7 +1074,7 @@ static void loadElementsByPartition(const PartitionLayout &layout,
     // 1) Owned elements
     nLocal = 0;
     for (int entTag : layout.ownedEntities3D)
-        nLocal += static_cast<int>(loadEntity(3, entTag));
+        nLocal += static_cast<int>(loadEntity(cellDim, entTag));
 
     // 2) Halo elements + owner rank lookup
     nHalo = 0;
@@ -1067,14 +1083,14 @@ static void loadElementsByPartition(const PartitionLayout &layout,
         // Get the ghost-tag → owner-partition map for THIS halo entity
         std::vector<std::size_t> ghostTags;
         std::vector<int>         ghostParts;
-        gmsh::model::mesh::getGhostElements(3, entTag, ghostTags, ghostParts);
+        gmsh::model::mesh::getGhostElements(cellDim, entTag, ghostTags, ghostParts);
         std::unordered_map<std::size_t, int> tagToOwner;
         tagToOwner.reserve(ghostTags.size());
         for (std::size_t i = 0; i < ghostTags.size(); ++i)
             tagToOwner[ghostTags[i]] = ghostParts[i] - 1; // partitions are 1-based
 
         const std::size_t before = elTags.size();
-        const std::size_t added  = loadEntity(3, entTag);
+        const std::size_t added  = loadEntity(cellDim, entTag);
         nHalo += static_cast<int>(added);
 
         for (std::size_t i = 0; i < added; ++i)
@@ -1094,13 +1110,14 @@ static void loadBarycentersByPartition(const PartitionLayout &layout,
                                        std::vector<double> &barycenters)
 {
     barycenters.clear();
+    const int cellDim = gmsh::model::getDimension();
     auto add = [&](int dim, int entTag) {
         std::vector<double> b;
         gmsh::model::mesh::getBarycenters(elementType, entTag, false, true, b);
         barycenters.insert(barycenters.end(), b.begin(), b.end());
     };
-    for (int t : layout.ownedEntities3D) add(3, t);
-    for (int t : layout.haloEntities3D) add(3, t);
+    for (int t : layout.ownedEntities3D) add(cellDim, t);
+    for (int t : layout.haloEntities3D) add(cellDim, t);
 }
 
 /**
@@ -1114,6 +1131,7 @@ static void loadFaceNodesByPartition(const PartitionLayout &layout,
                                      std::vector<std::size_t> &fNodeTags)
 {
     fNodeTags.clear();
+    const int cellDim = gmsh::model::getDimension();
     auto add = [&](int dim, int entTag) {
         std::vector<std::size_t> tmp;
         if (faceNumNodes > 0)
@@ -1122,8 +1140,8 @@ static void loadFaceNodesByPartition(const PartitionLayout &layout,
             gmsh::model::mesh::getElementEdgeNodes(elementType, tmp, entTag);
         fNodeTags.insert(fNodeTags.end(), tmp.begin(), tmp.end());
     };
-    for (int t : layout.ownedEntities3D) add(3, t);
-    for (int t : layout.haloEntities3D) add(3, t);
+    for (int t : layout.ownedEntities3D) add(cellDim, t);
+    for (int t : layout.haloEntities3D) add(cellDim, t);
 }
 
 /**
@@ -1137,128 +1155,7 @@ static void loadFaceNodesByPartition(const PartitionLayout &layout,
  */
 PartitionLayout buildPartitionLayout()
 {
-    const int myPart = Parallel::rank() + 1; // gmsh partition tags are 1-based
-    const int N      = Parallel::size();
-
-    // 1) Partition the mesh (only if not already partitioned).
-    //    Heuristic for "already partitioned": at least one 3D entity has
-    //    a non-empty partition list.
-    bool alreadyPartitioned = false;
-    {
-        std::vector<std::pair<int,int>> ents;
-        gmsh::model::getEntities(ents, 3);
-        for (auto &[d, t] : ents)
-        {
-            std::vector<int> ps;
-            gmsh::model::getPartitions(d, t, ps);
-            if (!ps.empty()) { alreadyPartitioned = true; break; }
-        }
-    }
-
-    if (!alreadyPartitioned)
-    {
-        gmsh::option::setNumber("Mesh.PartitionCreateGhostCells", 1);
-        gmsh::option::setNumber("Mesh.PartitionCreateTopology",   1);
-        gmsh::model::mesh::partition(N);
-    }
-
-    PartitionLayout layout;
-
-    // 2) Walk 3D entities. An entity belongs to this rank if its partition
-    //    list contains myPart. We then split owned vs halo by the presence
-    //    of ghost elements.
-    {
-        std::vector<std::pair<int,int>> ents;
-        gmsh::model::getEntities(ents, 3);
-        for (auto &[d, tag] : ents)
-        {
-            std::vector<int> partitions;
-            gmsh::model::getPartitions(d, tag, partitions);
-            if (std::find(partitions.begin(), partitions.end(), myPart) == partitions.end())
-                continue;
-
-            std::vector<std::size_t> ghostTags;
-            std::vector<int>         ghostParts;
-            gmsh::model::mesh::getGhostElements(d, tag, ghostTags, ghostParts);
-
-            if (ghostTags.empty())
-                layout.ownedEntities3D.push_back(tag);
-            else
-                layout.haloEntities3D.push_back(tag);
-        }
-    }
-
-    // 3) Walk 2D entities. Three categories:
-    //    - partitions = {myPart}        → physical boundary face of this rank
-    //    - partitions = {myPart, k}     → interface with rank k-1
-    //    - everything else              → not relevant for this rank
-    {
-        std::vector<std::pair<int,int>> ents;
-        gmsh::model::getEntities(ents, 2);
-        for (auto &[d, tag] : ents)
-        {
-            std::vector<int> partitions;
-            gmsh::model::getPartitions(d, tag, partitions);
-            if (partitions.empty()) continue;
-            if (std::find(partitions.begin(), partitions.end(), myPart) == partitions.end())
-                continue;
-
-            if (partitions.size() == 1)
-            {
-                layout.boundaryEntities2D.push_back(tag);
-            }
-            else if (partitions.size() == 2)
-            {
-                int otherPart = (partitions[0] == myPart) ? partitions[1] : partitions[0];
-                layout.interfaceEntitiesByRank[otherPart - 1].push_back(tag);
-            }
-            // size > 2 (triple junction etc.) is rare in practice; skip for now.
-        }
-    }
-
-    // 4) Diagnostics
-    {
-        size_t nOwnedEls = 0, nHaloEls = 0, nBdryFaces = 0, nInterfaceFaces = 0;
-        for (int tag : layout.ownedEntities3D)
-        {
-            std::vector<int> et;
-            std::vector<std::vector<std::size_t>> elt, nt;
-            gmsh::model::mesh::getElements(et, elt, nt, 3, tag);
-            for (auto &v : elt) nOwnedEls += v.size();
-        }
-        for (int tag : layout.haloEntities3D)
-        {
-            std::vector<int> et;
-            std::vector<std::vector<std::size_t>> elt, nt;
-            gmsh::model::mesh::getElements(et, elt, nt, 3, tag);
-            for (auto &v : elt) nHaloEls += v.size();
-        }
-        for (int tag : layout.boundaryEntities2D)
-        {
-            std::vector<int> et;
-            std::vector<std::vector<std::size_t>> elt, nt;
-            gmsh::model::mesh::getElements(et, elt, nt, 2, tag);
-            for (auto &v : elt) nBdryFaces += v.size();
-        }
-        for (auto &kv : layout.interfaceEntitiesByRank)
-            for (int tag : kv.second)
-            {
-                std::vector<int> et;
-                std::vector<std::vector<std::size_t>> elt, nt;
-                gmsh::model::mesh::getElements(et, elt, nt, 2, tag);
-                for (auto &v : elt) nInterfaceFaces += v.size();
-            }
-
-        std::cout << "[MPI rank " << Parallel::rank() << "] partition layout: "
-                  << nOwnedEls   << " owned 3D els, "
-                  << nHaloEls    << " halo 3D els, "
-                  << nBdryFaces  << " physical bdry faces, "
-                  << nInterfaceFaces << " interface faces"
-                  << " (" << layout.interfaceEntitiesByRank.size() << " neighbours)\n"
-                  << std::flush;
-    }
-
-    return layout;
+    return meshpartitioning::buildLayoutForPartition(Parallel::rank(), Parallel::size(), true);
 }
 
 #endif // DG_USE_MPI
