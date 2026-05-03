@@ -55,8 +55,14 @@ void init(int* argc, char*** argv) {
 
     const int launcherSize = detectLauncherSize();
     const int launcherRank = detectLauncherRank();
-    if (launcherSize == _size && launcherRank >= 0 && launcherRank < launcherSize)
-        _rank = launcherRank;
+    // Broader condition: trust launcher env vars even when MPI returns
+    // corrupted values (gmsh SDK static initializers corrupt Comm_size).
+    if (launcherSize > 0 && launcherRank >= 0 && launcherRank < launcherSize) {
+        if (launcherSize != _size || launcherRank != _rank) {
+            _size = launcherSize;
+            _rank = launcherRank;
+        }
+    }
 }
 
 void finalize() { MPI_Finalize(); }

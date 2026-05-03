@@ -187,6 +187,7 @@ Mesh::Mesh(Config config) : config(config)
     m_elGradBasisFcts.resize(m_elNum * m_elNumNodes * m_elNumIntPts * 3);
 
     // #pragma omp parallel for
+    #pragma omp parallel for schedule(static) num_threads(config.numThreads) firstprivate(jacobian)
     for (size_t el = 0; el < m_elNum; ++el)
     {
         for (int g = 0; g < m_elNumIntPts; ++g)
@@ -344,6 +345,7 @@ Mesh::Mesh(Config config) : config(config)
     pt = prof_clk::now();
     m_fGradBasisFcts.resize(m_fNum * m_fNumNodes * m_fNumIntPts * 3);
     // #pragma omp parallel for
+    #pragma omp parallel for schedule(static) num_threads(config.numThreads) firstprivate(jacobian)
     for (int f = 0; f < m_fNum; ++f)
     {
         for (int g = 0; g < m_fNumIntPts; ++g)
@@ -1799,41 +1801,59 @@ std::vector<size_t> vector_of_tags(size_t vec_size, size_t offset)
 }
 void Mesh::getConnectivityFaceToElement()
 {
-    //! TIMER start ////////////////////////////////
     auto start = std::chrono::system_clock::now();
-    //! ////////////////////////////////////////////
+
+    // Phase 9.3 refactor: O(N) hashmap lookup replacing O(N²) double loop.
+    // Old algorithm: for each element face incidence, scan all unique faces by
+    // isNCoincidentValues → O(Nf²). Dominated preprocessing on large hex meshes.
+    // New algorithm: build a lookup map from sorted face key → unique face index,
+    // then for each incidence do a single O(1) lookup.
+
     m_fNbrElIds.resize(m_fNum);
 
-    std::vector<std::vector<size_t>> m_elFNodeTagsOrdered_tab = vector_to_matrix(m_elFNodeTagsOrdered, m_fNumNodes);
-    std::vector<std::vector<size_t>> m_fNodeTagsOrdered_tab = vector_to_matrix(m_fNodeTagsOrdered, m_fNumNodes);
+    const size_t numUniqueFaces = m_fNodeTagsOrdered.size() / m_fNumNodes;
+    const size_t numIncidences  = m_elFNodeTagsOrdered.size() / m_fNumNodes;
 
-    std::vector<size_t> elFtags = vector_of_tags(m_elFNodeTagsOrdered_tab.size(), m_fNumPerEl); //! vector of elements face tags
-    std::vector<size_t> ftags = vector_of_tags(m_fNodeTagsOrdered_tab.size(), 1);               //! vector of face tags
-
-    for (size_t i = 0; i < m_elFNodeTagsOrdered_tab.size(); i++)
-    {
-        for (size_t j = 0; j < m_fNodeTagsOrdered_tab.size(); j++)
-        {
-            if (isNCoincidentValues(m_elFNodeTagsOrdered_tab[i], m_fNodeTagsOrdered_tab[j], m_fNumNodes))
-            {
-                m_elFIds.push_back(ftags[j]);
-                m_fNbrElIds[ftags[j]].push_back(elFtags[i]);
-                if (m_fNbrElIds[ftags[j]].size() == 2)
-                {
-                    erase_row_from_matrix(m_fNodeTagsOrdered_tab, j);
-                    erase_row_from_vector(ftags, j);
-                    break;
-                }
-                // if(flag) break;
+    struct FaceKeyHash {
+        size_t operator()(const std::array<size_t, 8> &k) const noexcept {
+            size_t h = 1469598103934665603ull;
+            for (auto v : k) {
+                h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
             }
+            return h;
         }
+    };
+
+    const size_t kNodes = std::min((size_t)m_fNumNodes, (size_t)8);
+    auto makeKey = [&](const std::vector<size_t> &tags, size_t baseIdx,
+                       std::array<size_t, 8> &out) {
+        for (size_t k = 0; k < kNodes; ++k)
+            out[k] = tags[baseIdx + k];
+        for (size_t k = kNodes; k < 8; ++k)
+            out[k] = 0;
+    };
+
+    std::unordered_map<std::array<size_t, 8>, size_t, FaceKeyHash> faceIndex;
+    faceIndex.reserve(numUniqueFaces * 2);
+    std::array<size_t, 8> key{};
+    for (size_t fi = 0; fi < numUniqueFaces; ++fi) {
+        makeKey(m_fNodeTagsOrdered, fi * m_fNumNodes, key);
+        faceIndex.emplace(key, fi);
     }
 
-    //! TIMER END ///////////////////////////////////////////////////////////////////
+    for (size_t i = 0; i < numIncidences; ++i) {
+        makeKey(m_elFNodeTagsOrdered, i * m_fNumNodes, key);
+        auto it = faceIndex.find(key);
+        if (it == faceIndex.end()) continue;
+        const size_t fi = it->second;
+        const size_t el = i / m_fNumPerEl;
+        m_elFIds.push_back(fi);
+        m_fNbrElIds[fi].push_back(el);
+    }
+
     auto end = std::chrono::system_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     screen_display::write_value("Elapsed time (getConnectivityFaceToElement):", elapsed.count() * 1.0e-6, "s", BLUE);
-    //! //////////////////////////////////////////////////////////////////////////////
 }
 
 /**
