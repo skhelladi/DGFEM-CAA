@@ -11,3 +11,4 @@ PLAN.md
 .serena/
 .vscode/
 benchmarks/
+.DS_Store

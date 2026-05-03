@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <chrono>
+#include <cstdint>
 #include <gmsh.h>
 #include <iostream>
 #include <omp.h>
@@ -524,7 +525,15 @@ Mesh::Mesh(Config config) : config(config)
             }
             case 2:
             {
-                eigen::cross(&fGradBasisFct(f, g, 0), &fGradBasisFct(f, g, 1), normal.data());
+                double tangentU[3] = {
+                    fJacobian(f, g, 0, 0),
+                    fJacobian(f, g, 1, 0),
+                    fJacobian(f, g, 2, 0)};
+                double tangentV[3] = {
+                    fJacobian(f, g, 0, 1),
+                    fJacobian(f, g, 1, 1),
+                    fJacobian(f, g, 2, 1)};
+                eigen::cross(tangentU, tangentV, normal.data());
                 if (g != 0 && eigen::dot(&fNormal(f, 0), normal.data(), m_Dim) < 0)
                 {
                     for (int x = 0; x < m_Dim; ++x)
@@ -545,9 +554,6 @@ Mesh::Mesh(Config config) : config(config)
             m_fBiTangents.insert(m_fBiTangents.end(), bitangent.begin(), bitangent.end());
         }
     }
-
-    if (m_elDim == 3 && m_elOrder != 1)
-        fc = -1;
 
     profMark("10_face_normals_tangents", pt);
 
@@ -1006,49 +1012,91 @@ void Mesh::buildHalo()
     m_haloRecvElIds.clear();
     m_haloCommPlans.clear();
 
+    std::set<int> neighbours;
     for (int f = 0; f < m_fNum; ++f)
     {
-        if (!m_fIsInterface[f]) continue;
+        if (!m_fIsInterface[f])
+            continue;
 
         m_haloFaces.push_back(f);
-
-        size_t el0 = m_fNbrElIds[f][0];
-        size_t el1 = m_fNbrElIds[f][1];
-        int    r0  = m_elOwnerRank[el0];
-        int    r1  = m_elOwnerRank[el1];
-
-        size_t localEl  = (r0 == myRank) ? el0 : el1;
-        size_t remoteEl = (r0 == myRank) ? el1 : el0;
-        int    remRank  = m_fNbrRank[f];
-
-        auto &sendList = m_haloSendElIds[remRank];
-        if (std::find(sendList.begin(), sendList.end(), localEl) == sendList.end())
-            sendList.push_back(localEl);
-
-        auto &recvList = m_haloRecvElIds[remRank];
-        if (std::find(recvList.begin(), recvList.end(), remoteEl) == recvList.end())
-            recvList.push_back(remoteEl);
+        if (m_fNbrRank[f] >= 0)
+            neighbours.insert(m_fNbrRank[f]);
     }
 
-    // Sort each halo list by GMSH GLOBAL TAG of the element. Both ranks of
-    // a pair sort the same way, so A's sendList[B][i] and B's recvList[A][i]
-    // refer to the SAME physical element. This makes haloExchange() a pure
-    // value transfer, no IDs needed.
+    std::unordered_map<std::size_t, std::size_t> localElByTag;
+    localElByTag.reserve(static_cast<std::size_t>(m_localElEnd - m_localElStart));
+    for (int el = m_localElStart; el < m_localElEnd; ++el)
+        localElByTag[m_elTags[el]] = static_cast<std::size_t>(el);
+
+    for (std::size_t el = static_cast<std::size_t>(m_localElEnd); el < m_elTags.size(); ++el)
+    {
+        const int owner = m_elOwnerRank[el];
+        if (owner < 0 || owner == myRank)
+            continue;
+
+        neighbours.insert(owner);
+        auto &recvList = m_haloRecvElIds[owner];
+        if (std::find(recvList.begin(), recvList.end(), el) == recvList.end())
+            recvList.push_back(el);
+    }
+
     auto sortByGmshTag = [&](std::vector<size_t> &lst) {
         std::sort(lst.begin(), lst.end(),
                   [&](size_t a, size_t b) { return m_elTags[a] < m_elTags[b]; });
     };
-    for (auto &kv : m_haloSendElIds) sortByGmshTag(kv.second);
-    for (auto &kv : m_haloRecvElIds) sortByGmshTag(kv.second);
+    for (auto &kv : m_haloRecvElIds)
+        sortByGmshTag(kv.second);
+
+    for (int rank : neighbours)
+    {
+        std::vector<std::uint64_t> requestedTags;
+        const auto recvIt = m_haloRecvElIds.find(rank);
+        if (recvIt != m_haloRecvElIds.end())
+        {
+            requestedTags.reserve(recvIt->second.size());
+            for (std::size_t el : recvIt->second)
+                requestedTags.push_back(static_cast<std::uint64_t>(m_elTags[el]));
+        }
+
+        int sendCount = static_cast<int>(requestedTags.size());
+        int recvCount = 0;
+        MPI_Sendrecv(&sendCount, 1, MPI_INT, rank, 4201,
+                     &recvCount, 1, MPI_INT, rank, 4201,
+                     Parallel::comm(), MPI_STATUS_IGNORE);
+
+        std::vector<std::uint64_t> remoteRequestedTags(static_cast<std::size_t>(recvCount));
+        MPI_Sendrecv(requestedTags.empty() ? nullptr : requestedTags.data(),
+                     sendCount,
+                     MPI_UINT64_T,
+                     rank,
+                     4202,
+                     remoteRequestedTags.empty() ? nullptr : remoteRequestedTags.data(),
+                     recvCount,
+                     MPI_UINT64_T,
+                     rank,
+                     4202,
+                     Parallel::comm(),
+                     MPI_STATUS_IGNORE);
+
+        auto &sendList = m_haloSendElIds[rank];
+        sendList.reserve(remoteRequestedTags.size());
+        for (std::uint64_t tag : remoteRequestedTags)
+        {
+            auto localIt = localElByTag.find(static_cast<std::size_t>(tag));
+            if (localIt == localElByTag.end())
+                Fatal_Error("Halo exchange requested an element tag not owned by this rank");
+            sendList.push_back(localIt->second);
+        }
+    }
+
+    // recv lists are sorted by requested tag; send lists follow the exact
+    // order requested by the neighbour. The data exchange can therefore stay
+    // ID-free while remaining robust to Gmsh entity ordering at high order.
 
     const int fieldCount = 4;
     const int dofsPerEl = m_elNumNodes;
     if (fieldCount > 0 && dofsPerEl > 0)
     {
-        std::set<int> neighbours;
-        for (const auto &kv : m_haloSendElIds) neighbours.insert(kv.first);
-        for (const auto &kv : m_haloRecvElIds) neighbours.insert(kv.first);
-
         m_haloCommPlans.reserve(neighbours.size());
         for (int rank : neighbours)
         {
@@ -1760,12 +1808,10 @@ void Mesh::getUniqueFaceNodeTags()
     // (from gmsh::createFaces / getAllFaces) by linear search → O(Nf²)
     // dominated everything (94% of preprocessing on 16k tets).
     //
-    // New algorithm: build a sorted "native-node" key per face and insert
+    // New algorithm: build a sorted complete-node key per face and insert
     // into an unordered_map. First-occurrence wins; subsequent occurrences
     // are duplicates and dropped. → O(Nf) average.
 
-    const bool hasQuadrilateralFaces = (m_fDim == 2 && m_fName == "quadrangle");
-    const size_t fNumNativeNodes = (m_fDim < 2) ? 2 : (hasQuadrilateralFaces ? 4 : 3);
     const size_t totalFaces = m_elFNodeTags.size() / m_fNumNodes;
 
     auto start = std::chrono::system_clock::now();
@@ -1776,37 +1822,28 @@ void Mesh::getUniqueFaceNodeTags()
         std::sort(m_elFNodeTagsOrdered.begin() + i,
                   m_elFNodeTagsOrdered.begin() + (i + m_fNumNodes));
 
-    // 2) Build canonical key per face from its sorted native-node tuple.
-    //    For typical sizes (2/3/4 native nodes), keep keys in a small fixed
-    //    array and use a custom hash combiner — much faster than std::string.
-    auto canonicalKey = [&](size_t faceIdx, std::array<size_t, 4> &out) {
-        for (size_t k = 0; k < fNumNativeNodes; ++k)
-            out[k] = m_elFNodeTagsOrdered[faceIdx * m_fNumNodes + k];
-        for (size_t k = fNumNativeNodes; k < 4; ++k)
-            out[k] = 0;
-    };
-
-    struct KeyHash {
-        size_t operator()(const std::array<size_t, 4> &k) const noexcept {
-            // splitmix-style mix; cheap and well-distributed for moderate Nf
-            size_t h = 1469598103934665603ull;
-            for (auto v : k) {
-                h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-            }
-            return h;
+    // 2) Build canonical key per face from the complete sorted node tuple.
+    //    In high order, using only the first primary nodes after sorting can
+    //    accidentally identify two distinct faces that merely share an edge.
+    auto makeKey = [&](const std::vector<size_t> &tags, size_t baseIdx) {
+        std::string key;
+        key.reserve(static_cast<size_t>(m_fNumNodes) * 12);
+        for (int k = 0; k < m_fNumNodes; ++k)
+        {
+            key += std::to_string(tags[baseIdx + static_cast<size_t>(k)]);
+            key.push_back(':');
         }
+        return key;
     };
 
-    std::unordered_map<std::array<size_t, 4>, size_t, KeyHash> firstOccurrence;
+    std::unordered_map<std::string, size_t> firstOccurrence;
     firstOccurrence.reserve(totalFaces);
     std::vector<size_t> uniqueFaceIndices;
     uniqueFaceIndices.reserve(totalFaces);
 
-    std::array<size_t, 4> key{0, 0, 0, 0};
     for (size_t i = 0; i < totalFaces; ++i)
     {
-        canonicalKey(i, key);
-        auto [it, inserted] = firstOccurrence.try_emplace(key, i);
+        auto [it, inserted] = firstOccurrence.try_emplace(makeKey(m_elFNodeTagsOrdered, i * m_fNumNodes), i);
         if (inserted) uniqueFaceIndices.push_back(i);
     }
 
@@ -1861,39 +1898,25 @@ void Mesh::getConnectivityFaceToElement()
 
     const size_t numUniqueFaces = m_fNodeTagsOrdered.size() / m_fNumNodes;
     const size_t numIncidences  = m_elFNodeTagsOrdered.size() / m_fNumNodes;
-    const bool hasQuadrilateralFaces = (m_fDim == 2 && m_fName == "quadrangle");
-    const size_t fNumNativeNodes = (m_fDim < 2) ? 2 : (hasQuadrilateralFaces ? 4 : 3);
-
-    struct FaceKeyHash {
-        size_t operator()(const std::array<size_t, 8> &k) const noexcept {
-            size_t h = 1469598103934665603ull;
-            for (auto v : k) {
-                h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-            }
-            return h;
+    auto makeKey = [&](const std::vector<size_t> &tags, size_t baseIdx) {
+        std::string key;
+        key.reserve(static_cast<size_t>(m_fNumNodes) * 12);
+        for (int k = 0; k < m_fNumNodes; ++k)
+        {
+            key += std::to_string(tags[baseIdx + static_cast<size_t>(k)]);
+            key.push_back(':');
         }
+        return key;
     };
 
-    const size_t kNodes = std::min(fNumNativeNodes, (size_t)8);
-    auto makeKey = [&](const std::vector<size_t> &tags, size_t baseIdx,
-                       std::array<size_t, 8> &out) {
-        for (size_t k = 0; k < kNodes; ++k)
-            out[k] = tags[baseIdx + k];
-        for (size_t k = kNodes; k < 8; ++k)
-            out[k] = 0;
-    };
-
-    std::unordered_map<std::array<size_t, 8>, size_t, FaceKeyHash> faceIndex;
+    std::unordered_map<std::string, size_t> faceIndex;
     faceIndex.reserve(numUniqueFaces * 2);
-    std::array<size_t, 8> key{};
     for (size_t fi = 0; fi < numUniqueFaces; ++fi) {
-        makeKey(m_fNodeTagsOrdered, fi * m_fNumNodes, key);
-        faceIndex.emplace(key, fi);
+        faceIndex.emplace(makeKey(m_fNodeTagsOrdered, fi * m_fNumNodes), fi);
     }
 
     for (size_t i = 0; i < numIncidences; ++i) {
-        makeKey(m_elFNodeTagsOrdered, i * m_fNumNodes, key);
-        auto it = faceIndex.find(key);
+        auto it = faceIndex.find(makeKey(m_elFNodeTagsOrdered, i * m_fNumNodes));
         if (it == faceIndex.end()) continue;
         const size_t fi = it->second;
         const size_t el = i / m_fNumPerEl;
