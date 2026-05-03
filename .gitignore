@@ -1,6 +1,12 @@
 
 3rdParty/
-
 build*/
-
 results/
+.*/
+*.csv
+*.msh
+*.pvd
+PLAN.md
+.claude/
+.serena/
+.vscode/
