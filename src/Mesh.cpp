@@ -1524,7 +1524,7 @@ void Mesh::precomputeFlux(std::vector<double> &u, std::vector<std::vector<double
         std::vector<double> FIntPts(m_fNumIntPts, 0);
         std::vector<double> Fnum(m_Dim, 0);
 
-#pragma omp parallel for schedule(static)
+#pragma omp for schedule(static)
         for (int kf = 0; kf < nFacesToProcess; ++kf)
         {
 #ifdef DG_USE_MPI
@@ -1554,8 +1554,6 @@ void Mesh::precomputeFlux(std::vector<double> &u, std::vector<std::vector<double
                     {
                         for (int x = 0; x < m_Dim; ++x)
                             Fnum[x] = 0.5 * ((Flux[elUp][x] + Flux[elDn][x]) + fc * config.c0 * fNormal(f, g, x) * (u[elUp] - u[elDn]));
-/////////////////////////
-#pragma omp atomic update
                         FIntPts[g] += eigen::dot(&fNormal(f, g), Fnum.data(), m_Dim) * fBasisFct(g, i);
                     }
                 }
@@ -1567,8 +1565,6 @@ void Mesh::precomputeFlux(std::vector<double> &u, std::vector<std::vector<double
                 fFlux(f, n) = 0;
                 for (int g = 0; g < m_fNumIntPts; ++g)
                 {
-////////////////////////
-#pragma omp atomic update
                     fFlux(f, n) += m_fWeight[g] * fBasisFct(g, n) * FIntPts[g] * fJacobianDet(f, g);
                 }
             }
